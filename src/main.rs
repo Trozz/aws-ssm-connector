@@ -336,17 +336,17 @@ async fn start_ssm_session(
     remote_host: &str,
 ) -> Result<()> {
     let mut cmd = Command::new("aws");
-    cmd.args(&["ssm", "start-session"]);
+    cmd.args(["ssm", "start-session"]);
 
     if let Some(profile) = profile.as_ref() {
-        cmd.args(&["--profile", profile]);
+        cmd.args(["--profile", profile]);
     }
 
     if let Some(region) = region.as_ref() {
-        cmd.args(&["--region", region]);
+        cmd.args(["--region", region]);
     }
 
-    cmd.args(&["--target", instance_id]);
+    cmd.args(["--target", instance_id]);
 
     if port_forward {
         let local_port =
@@ -355,17 +355,17 @@ async fn start_ssm_session(
             remote_port.ok_or_else(|| anyhow!("Remote port required for port forwarding"))?;
 
         if remote_host == "localhost" || remote_host == "127.0.0.1" {
-            cmd.args(&["--document-name", "AWS-StartPortForwardingSession"])
-                .args(&[
+            cmd.args(["--document-name", "AWS-StartPortForwardingSession"])
+                .args([
                     "--parameters",
                     &format!("localPortNumber={},portNumber={}", local_port, remote_port),
                 ]);
         } else {
-            cmd.args(&[
+            cmd.args([
                 "--document-name",
                 "AWS-StartPortForwardingSessionToRemoteHost",
             ])
-            .args(&[
+            .args([
                 "--parameters",
                 &format!(
                     "localPortNumber={},portNumber={},host={}",
@@ -472,11 +472,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Validate port forwarding arguments
-    if cli.port_forward {
-        if cli.local_port.is_none() || cli.remote_port.is_none() {
-            print_error("Port forwarding mode requires both --local-port and --remote-port.");
-            std::process::exit(1);
-        }
+    if cli.port_forward && (cli.local_port.is_none() || cli.remote_port.is_none()) {
+        print_error("Port forwarding mode requires both --local-port and --remote-port.");
+        std::process::exit(1);
     }
 
     print_debug("AWS SSM Connect Tool", cli.verbose);
