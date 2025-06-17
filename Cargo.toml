@@ -1,0 +1,28 @@
+[package]
+name = "aws-ssm-connect"
+version = "0.1.0"
+edition = "2021"
+authors = ["trozz"]
+description = "Connect to AWS EC2 instances via SSM using instance Name tags"
+repository = "https://github.com/trozz/ssm-connector"
+license = "MIT"
+readme = "README.md"
+keywords = ["aws", "ssm", "ec2", "session-manager", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+aws-config = "1.1.0"
+aws-sdk-ec2 = "1.8.0"
+aws-sdk-ssm = "1.8.0"
+aws-sdk-sts = "1.8.0"
+clap = { version = "4.4", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
+colored = "2.0"
+anyhow = "1.0"
+dialoguer = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
