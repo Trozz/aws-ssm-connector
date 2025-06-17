@@ -1,0 +1,144 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.0.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Get previous tag
+      id: previoustag
+      run: |
+        PREVIOUS_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+        echo "previous_tag=$PREVIOUS_TAG" >> $GITHUB_OUTPUT
+    
+    - name: Generate Release Notes
+      id: release_notes
+      run: |
+        cat > release_notes.md << 'EOF'
+        ## What's New
+        
+        EOF
+        
+        if [ -z "${{ steps.previoustag.outputs.previous_tag }}" ]; then
+          echo "Initial release of AWS SSM Connect CLI!" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "### Features" >> release_notes.md
+          echo "- Connect to EC2 instances via SSM using instance Name tags" >> release_notes.md
+          echo "- List available instances with their connection status" >> release_notes.md
+          echo "- Automatic profile and region management" >> release_notes.md
+          echo "- Interactive instance selection when multiple matches found" >> release_notes.md
+        else
+          # Get commits since last tag
+          git log ${{ steps.previoustag.outputs.previous_tag }}..HEAD --pretty=format:"- %s" --reverse | grep -E "^- (feat|fix|perf|refactor):" | sed 's/^- feat://' | sed 's/^- fix://' | sed 's/^- perf://' | sed 's/^- refactor://' >> release_notes.md || echo "- Various improvements and bug fixes" >> release_notes.md
+        fi
+        
+        echo "" >> release_notes.md
+        echo "### Installation" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "Download the appropriate binary for your platform below, make it executable, and move it to your PATH:" >> release_notes.md
+        echo "" >> release_notes.md
+        echo '```bash' >> release_notes.md
+        echo "chmod +x aws-ssm-connect-*" >> release_notes.md
+        echo "sudo mv aws-ssm-connect-* /usr/local/bin/aws-ssm-connect" >> release_notes.md
+        echo '```' >> release_notes.md
+        echo "" >> release_notes.md
+        echo "### Usage" >> release_notes.md
+        echo "" >> release_notes.md
+        echo '```bash' >> release_notes.md
+        echo "# Connect to an instance by name" >> release_notes.md
+        echo "aws-ssm-connect my-instance" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "# List available instances" >> release_notes.md
+        echo "aws-ssm-connect --list" >> release_notes.md
+        echo "" >> release_notes.md
+        echo "# Use a specific AWS profile" >> release_notes.md
+        echo "aws-ssm-connect my-instance --profile production" >> release_notes.md
+        echo '```' >> release_notes.md
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v${{ github.event.inputs.version }}
+        release_name: AWS SSM Connect v${{ github.event.inputs.version }}
+        body_path: ./release_notes.md
+        draft: false
+        prerelease: false
+
+  build-and-upload:
+    name: Build and Upload
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: aws-ssm-connect
+            asset_name: aws-ssm-connect-${{ github.event.inputs.version }}-aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary_name: aws-ssm-connect
+            asset_name: aws-ssm-connect-${{ github.event.inputs.version }}-x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: aws-ssm-connect
+            asset_name: aws-ssm-connect-${{ github.event.inputs.version }}-x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary_name: aws-ssm-connect
+            asset_name: aws-ssm-connect-${{ github.event.inputs.version }}-x86_64-unknown-linux-musl
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+    
+    - name: Install musl-tools (Linux)
+      if: matrix.target == 'x86_64-unknown-linux-musl'
+      run: sudo apt-get update && sudo apt-get install -y musl-tools
+    
+    - name: Update version in Cargo.toml
+      run: |
+        sed -i.bak 's/^version = .*/version = "${{ github.event.inputs.version }}"/' Cargo.toml
+        rm Cargo.toml.bak || true
+    
+    - name: Build
+      run: cargo build --release --target ${{ matrix.target }}
+    
+    - name: Prepare Binary
+      run: |
+        cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} ${{ matrix.asset_name }}
+        chmod +x ${{ matrix.asset_name }}
+    
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create-release.outputs.upload_url }}
+        asset_path: ./${{ matrix.asset_name }}
+        asset_name: ${{ matrix.asset_name }}
+        asset_content_type: application/octet-stream
