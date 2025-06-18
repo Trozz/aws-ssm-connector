@@ -159,8 +159,15 @@ graph LR
 
 ## Prerequisites
 
+### For Standard Mode
 - [AWS CLI](https://aws.amazon.com/cli/) installed and configured
 - AWS Session Manager Plugin installed ([Installation Guide](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html))
+
+### For Native Mode (`--native`)
+- AWS Session Manager Plugin installed ([Installation Guide](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html))
+- AWS credentials configured (via environment variables, credentials file, or IAM role)
+
+### General Requirements
 - Rust toolchain (for building from source)
 - Appropriate AWS IAM permissions for EC2 and SSM
 - EC2 instances with SSM Agent installed and running
@@ -231,6 +238,11 @@ Options:
       --no-summary                 Hide connection summary after session ends
   -v, --verbose                    Enable verbose output for debugging
       --skip-ssm-check             Skip SSM availability checks for faster startup
+      --native                     Use native Rust SSM implementation instead of AWS CLI
+      --record <FILE>              Record session to file (script format)
+      --record-text <FILE>         Record session in plain text format (easier to view)
+      --view <FILE>                View a recorded session file
+      --play-speed <SPEED>         Playback speed for session replay (default: 1.0)
   -h, --help                       Print help
   -V, --version                    Print version
 ```
@@ -285,6 +297,28 @@ aws-ssm-connect my-instance --skip-ssm-check
 
 # Combine options for maximum performance
 aws-ssm-connect my-instance --skip-ssm-check --no-summary
+
+# Use native Rust implementation (no AWS CLI dependency)
+aws-ssm-connect my-instance --native
+
+# Native mode with port forwarding
+aws-ssm-connect my-instance --native -f -L 8080 -R 80
+
+# Record a session for documentation or training
+aws-ssm-connect my-instance --record session.log
+
+# Record with native mode for better performance
+aws-ssm-connect my-instance --native --record session.log
+
+# Record in plain text for easy viewing and sharing
+aws-ssm-connect my-instance --record-text setup-procedure.txt
+
+# View any recorded session (with asciinema-like playback!)
+aws-ssm-connect --view session.log
+
+# Control playback speed (like asciinema)
+aws-ssm-connect --view session.log --play-speed 2.0   # 2x speed
+aws-ssm-connect --view session.log --play-speed 0.5   # Half speed
 ```
 
 ### Performance Modes
@@ -303,6 +337,13 @@ For optimal performance, the tool offers several modes:
 **Silent Mode** (`--no-summary`)
 - Disables session summary display
 - Slightly faster session termination
+
+**Native Mode** (`--native`)
+- Uses AWS SDK for Rust to start sessions directly
+- Calls `session-manager-plugin` directly (same as AWS CLI internally uses)
+- Eliminates AWS CLI dependency while maintaining full compatibility
+- Better error handling and session management
+- Faster startup by skipping AWS CLI overhead
 
 ## AWS Configuration
 
@@ -360,6 +401,91 @@ After each session, the tool displays a summary including:
 - AWS profile and region used
 
 To disable the summary, use the `--no-summary` flag.
+
+## Session Recording
+
+The tool supports recording SSM sessions for documentation, training, and compliance purposes:
+
+### Basic Recording
+```bash
+# Record an interactive session (binary format)
+aws-ssm-connect web-server --record my-session.log
+
+# Record in plain text format (easier to view)
+aws-ssm-connect web-server --record-text my-session.txt
+
+# Record a port forwarding session
+aws-ssm-connect database-server -f -L 3306 -R 3306 --record db-tunnel.log
+```
+
+### Recording Features
+- **Built-in Recorder**: No external dependencies - works on all platforms with timing data
+- **Two Formats**: Binary format (full fidelity) or plain text (easier viewing)
+- **Full Session Capture**: Records all input/output including colors and control sequences
+- **Timing Files**: Automatic timing file generation on all platforms for perfect playback
+- **Cross-Platform**: Works on macOS, Linux, and other Unix-like systems
+- **Native Mode Support**: Works with both AWS CLI and native modes
+
+### Viewing Recorded Sessions
+
+#### 🎬 Asciinema-like Playback
+```bash
+# View with built-in viewer (asciinema-like experience!)
+aws-ssm-connect --view my-session.log
+
+# Control playback speed
+aws-ssm-connect --view my-session.log --play-speed 2.0   # 2x faster
+aws-ssm-connect --view my-session.log --play-speed 0.5   # Half speed
+aws-ssm-connect --view my-session.log --play-speed 3.0   # 3x faster
+
+# The built-in viewer will:
+# 1. Try built-in scriptreplay for asciinema-like timed playback (timing files)
+# 2. Fall back to external scriptreplay if available and built-in fails
+# 3. Display content with colors and formatting preserved
+# 4. Clean up problematic control sequences while keeping ANSI colors
+# 5. Fall back to text extraction if needed
+```
+
+#### 📋 Manual Viewing Methods
+```bash
+# For script format files:
+scriptreplay my-session.log               # Best for full replay experience
+scriptreplay my-session.log.timing my-session.log 2.0  # With custom speed
+col -bx < my-session.log                  # Clean up control sequences  
+strings my-session.log                    # Extract readable text
+
+# For plain text files:
+cat my-session.txt                        # Direct viewing
+less my-session.txt                       # Paginated viewing
+```
+
+**Viewing Features:**
+- **🎬 Built-in Asciinema-like Playback**: Real-time replay with original timing and speed control (no external dependencies!)
+- **⏱️ Timing Files**: Automatic timing file generation on Linux for perfect playback
+- **🎨 Color Preservation**: ANSI color codes are preserved and displayed on all platforms
+- **🧹 Smart Cleanup**: Removes problematic control sequences while keeping formatting
+- **📱 Multiple Fallbacks**: Automatically tries different viewing methods for best results
+- **🖥️ Cross-Platform**: Works on macOS, Linux, and other Unix-like systems
+- **⚡ Zero Dependencies**: Built-in scriptreplay implementation works out-of-the-box
+
+**Installation Notes:**
+```bash
+# No installation required! 
+# Built-in recorder and scriptreplay work out-of-the-box on all platforms
+
+# Optional: External scriptreplay (will be preferred if available)
+# macOS: brew install util-linux  
+# Ubuntu/Debian: sudo apt install bsdutils (usually already installed)
+
+# The tool automatically uses the best available method
+```
+
+### Use Cases
+- **Documentation**: Record setup procedures and troubleshooting steps
+- **Training**: Create training materials for team members
+- **Compliance**: Maintain audit trails of production access
+- **Debugging**: Capture issues for later analysis
+- **Knowledge Sharing**: Share solutions with team members
 
 ## Performance
 

@@ -24,8 +24,11 @@ use aws_sdk_ec2::types::Filter;
 use clap::Parser;
 use colored::*;
 use dialoguer::Select;
+use replay_rs::{Player, Recorder};
 use std::process::Command;
 use std::time::Instant;
+
+mod native_ssm;
 
 #[derive(Parser)]
 #[command(name = "aws-ssm-connect")]
@@ -33,7 +36,7 @@ use std::time::Instant;
 #[command(version = "1.0.0")]
 struct Cli {
     /// Instance name (Name tag value)
-    instance_name: String,
+    instance_name: Option<String>,
 
     /// AWS profile to use (defaults to AWS_PROFILE env var or default profile)
     #[arg(short = 'p', long = "profile")]
@@ -70,6 +73,27 @@ struct Cli {
     /// Skip SSM availability checks for faster startup (assumes all instances are SSM-enabled)
     #[arg(long = "skip-ssm-check")]
     skip_ssm_check: bool,
+
+    /// Use native Rust SSM implementation instead of AWS CLI
+    #[arg(long = "native")]
+    native: bool,
+
+    /// Record session to file with timing data (built-in recorder)
+    #[arg(long = "record")]
+    record: Option<String>,
+
+    /// Record session in plain text format (easier to view)
+    #[arg(long = "record-text")]
+    record_text: Option<String>,
+
+    /// View a recorded session file
+    #[arg(long = "view")]
+    view: Option<String>,
+
+    /// Playback speed for session replay (default: 1.0, 2.0 = 2x speed, 0.5 = half speed)
+    #[arg(long = "play-speed", default_value = "1.0")]
+    play_speed: f64,
+
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +105,19 @@ pub struct InstanceInfo {
     pub private_ip: Option<String>,
     pub public_ip: Option<String>,
     pub tags: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    pub instance_id: String,
+    pub profile: Option<String>,
+    pub region: Option<String>,
+    pub port_forward: bool,
+    pub local_port: Option<u16>,
+    pub remote_port: Option<u16>,
+    pub remote_host: String,
+    pub recording_mode: Option<(String, bool)>, // (filename, is_plain_text)
+    pub native: bool,
 }
 
 #[derive(Debug)]
@@ -127,6 +164,24 @@ pub fn print_error(message: &str) {
     eprintln!("{} {}", "[ERROR]".red().bold(), message);
 }
 
+fn handle_aws_error(error: &str, operation: &str) -> anyhow::Error {
+    // Check for common authentication issues and provide helpful messages
+    if error.contains("ExpiredToken") || error.contains("TokenRefreshRequired") {
+        anyhow!("AWS credentials have expired. Please refresh your credentials:\n  - For AWS SSO: Run 'aws sso login --profile <profile-name>'\n  - For regular credentials: Update your ~/.aws/credentials file")
+    } else if error.contains("InvalidUserID.NotFound") || error.contains("AccessDenied") {
+        anyhow!("AWS credentials are invalid or access is denied. Please check your credentials and permissions.")
+    } else if error.contains("NoCredentialsError") || error.contains("CredentialsNotLoaded") {
+        anyhow!("No AWS credentials found. Please configure your credentials:\n  - Run 'aws configure' to set up basic credentials\n  - Or use 'aws sso login' for SSO authentication\n  - Or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables")
+    } else if error.contains("UnknownHostException") || error.contains("NetworkingError") {
+        anyhow!("Network error connecting to AWS. Please check your internet connection and try again.")
+    } else if error.contains("dispatch failure") {
+        // This is likely a token expiration issue that's not being caught by the specific checks above
+        anyhow!("AWS authentication failed (likely expired credentials). Please refresh your credentials:\n  - For AWS SSO: Run 'aws sso login --profile <profile-name>'\n  - For regular credentials: Update your ~/.aws/credentials file or run 'aws configure'")
+    } else {
+        anyhow!("{}: {}", operation, error)
+    }
+}
+
 pub async fn get_aws_config(
     profile: Option<String>,
     region: Option<String>,
@@ -166,7 +221,7 @@ async fn validate_aws_config(config: &aws_config::SdkConfig, verbose: bool) -> R
             print_debug("AWS authentication successful", verbose);
             Ok(())
         }
-        Err(e) => Err(anyhow!("Failed to authenticate with AWS: {}", e)),
+        Err(e) => Err(handle_aws_error(&e.to_string(), "Failed to authenticate with AWS")),
     }
 }
 
@@ -195,7 +250,8 @@ async fn find_instances_by_name(
         .filters(name_filter)
         .filters(state_filter)
         .send()
-        .await?;
+        .await
+        .map_err(|e| handle_aws_error(&e.to_string(), "Failed to describe EC2 instances"))?;
 
     // Pre-allocate capacity based on typical reservation sizes
     let mut instances = Vec::with_capacity(response.reservations().len() * 2);
@@ -260,7 +316,8 @@ async fn check_ssm_availability(
                 .build()?,
         )
         .send()
-        .await?;
+        .await
+        .map_err(|e| handle_aws_error(&e.to_string(), "Failed to check SSM availability"))?;
 
     if response.instance_information_list().is_empty() {
         return Err(anyhow!(
@@ -407,6 +464,258 @@ async fn start_ssm_session(
     Ok(())
 }
 
+async fn start_session_manager_plugin(
+    ssm_client: &aws_sdk_ssm::Client,
+    config: &SessionConfig,
+) -> Result<()> {
+    // Start SSM session using AWS SDK
+    let mut request = ssm_client.start_session().target(&config.instance_id);
+    
+    if config.port_forward {
+        let local_port_val = config.local_port.ok_or_else(|| anyhow!("Local port required for port forwarding"))?;
+        let remote_port_val = config.remote_port.ok_or_else(|| anyhow!("Remote port required for port forwarding"))?;
+        
+        if config.remote_host == "localhost" || config.remote_host == "127.0.0.1" {
+            request = request.document_name("AWS-StartPortForwardingSession");
+        } else {
+            request = request.document_name("AWS-StartPortForwardingSessionToRemoteHost");
+        }
+        
+        print_info(&format!(
+            "Starting port forwarding session: localhost:{} → {}:{}",
+            local_port_val, &config.remote_host, remote_port_val
+        ));
+    } else {
+        print_info("Starting SSM session...");
+    }
+    
+    let response = request.send().await
+        .map_err(|e| handle_aws_error(&e.to_string(), "Failed to start SSM session"))?;
+    
+    let session_id = response.session_id().ok_or_else(|| anyhow!("No session ID returned"))?;
+    let stream_url = response.stream_url().ok_or_else(|| anyhow!("No stream URL returned"))?;
+    let token = response.token_value().ok_or_else(|| anyhow!("No token returned"))?;
+    
+    // Prepare session data for session-manager-plugin
+    let session_data = serde_json::json!({
+        "SessionId": session_id,
+        "TokenValue": token,
+        "StreamUrl": stream_url
+    });
+    
+    let parameters = if config.port_forward {
+        let local_port_val = config.local_port.unwrap();
+        let remote_port_val = config.remote_port.unwrap();
+        
+        if config.remote_host == "localhost" || config.remote_host == "127.0.0.1" {
+            serde_json::json!({
+                "localPortNumber": [local_port_val.to_string()],
+                "portNumber": [remote_port_val.to_string()]
+            })
+        } else {
+            serde_json::json!({
+                "localPortNumber": [local_port_val.to_string()],
+                "portNumber": [remote_port_val.to_string()],
+                "host": [&config.remote_host]
+            })
+        }
+    } else {
+        serde_json::json!({})
+    };
+    
+    let start_session_request = serde_json::json!({
+        "SessionId": session_id,
+        "Target": &config.instance_id
+    });
+    
+    // Call session-manager-plugin directly
+    let mut cmd = Command::new("session-manager-plugin");
+    cmd.arg(session_data.to_string())
+        .arg(config.region.as_deref().unwrap_or("us-east-1"))
+        .arg("StartSession")
+        .arg(config.profile.as_deref().unwrap_or(""))
+        .arg(start_session_request.to_string())
+        .arg(format!("https://ssm.{}.amazonaws.com", config.region.as_deref().unwrap_or("us-east-1")));
+    
+    if config.port_forward {
+        cmd.arg(parameters.to_string());
+    }
+    
+    let status = cmd.status()?;
+    
+    if !status.success() {
+        return Err(anyhow!(
+            "session-manager-plugin failed with exit code: {:?}",
+            status.code()
+        ));
+    }
+    
+    Ok(())
+}
+
+async fn start_session_with_recording(
+    config: SessionConfig,
+    ssm_client: Option<&aws_sdk_ssm::Client>,
+) -> Result<()> {
+    if let Some((output_file, is_plain_text)) = &config.recording_mode {
+        // Record session using script command (Unix/Linux/macOS)
+        let _session_type = if config.port_forward { "port-forward" } else { "interactive" };
+        
+        // Handle recording for different modes
+        if config.native {
+            if let Some(client) = ssm_client {
+                print_info(&format!("Recording session to: {}", output_file));
+                // For native mode, we need to wrap our session-manager-plugin call
+                return record_native_session(
+                    client, &config, output_file, *is_plain_text
+                ).await;
+            } else {
+                return Err(anyhow!("SSM client required for native mode"));
+            }
+        } else {
+            // For AWS CLI mode, we can use script to record the aws command
+            let mut aws_args = vec![
+                "ssm".to_string(),
+                "start-session".to_string(),
+                "--target".to_string(),
+                config.instance_id.clone(),
+            ];
+            
+            if let Some(p) = &config.profile {
+                aws_args.extend(vec!["--profile".to_string(), p.clone()]);
+            }
+            if let Some(r) = &config.region {
+                aws_args.extend(vec!["--region".to_string(), r.clone()]);
+            }
+            
+            if config.port_forward {
+                let local_port = config.local_port.ok_or_else(|| anyhow!("Local port required"))?;
+                let remote_port = config.remote_port.ok_or_else(|| anyhow!("Remote port required"))?;
+                
+                if config.remote_host == "localhost" || config.remote_host == "127.0.0.1" {
+                    aws_args.extend(vec![
+                        "--document-name".to_string(),
+                        "AWS-StartPortForwardingSession".to_string(),
+                        "--parameters".to_string(),
+                        format!("localPortNumber={},portNumber={}", local_port, remote_port),
+                    ]);
+                } else {
+                    aws_args.extend(vec![
+                        "--document-name".to_string(),
+                        "AWS-StartPortForwardingSessionToRemoteHost".to_string(),
+                        "--parameters".to_string(),
+                        format!("localPortNumber={},portNumber={},host={}", local_port, remote_port, &config.remote_host),
+                    ]);
+                }
+            }
+            
+            let timing_file = format!("{}.timing", output_file);
+            
+            // Use built-in recorder (works on all platforms with timing)
+            let mut aws_cmd = Command::new("aws");
+            aws_cmd.args(&aws_args);
+            let recorder = Recorder::new(output_file, &timing_file)?;
+            recorder.record_command(aws_cmd, *is_plain_text)?;
+            
+            return Ok(());
+        }
+    }
+    
+    // No recording, run normally
+    if config.native {
+        if let Some(client) = ssm_client {
+            start_session_manager_plugin(client, &config).await
+        } else {
+            Err(anyhow!("SSM client required for native mode"))
+        }
+    } else {
+        start_ssm_session(
+            &config.instance_id, config.profile, config.region,
+            config.port_forward, config.local_port, config.remote_port, &config.remote_host
+        ).await
+    }
+}
+
+async fn record_native_session(
+    ssm_client: &aws_sdk_ssm::Client,
+    config: &SessionConfig,
+    output_file: &str,
+    is_plain_text: bool,
+) -> Result<()> {
+    // Start SSM session using AWS SDK (same as start_session_manager_plugin)
+    let mut request = ssm_client.start_session().target(&config.instance_id);
+    
+    if config.port_forward {
+        config.local_port.ok_or_else(|| anyhow!("Local port required"))?;
+        config.remote_port.ok_or_else(|| anyhow!("Remote port required"))?;
+        
+        if config.remote_host == "localhost" || config.remote_host == "127.0.0.1" {
+            request = request.document_name("AWS-StartPortForwardingSession");
+        } else {
+            request = request.document_name("AWS-StartPortForwardingSessionToRemoteHost");
+        }
+    }
+    
+    let response = request.send().await
+        .map_err(|e| handle_aws_error(&e.to_string(), "Failed to start SSM session"))?;
+    
+    let session_id = response.session_id().ok_or_else(|| anyhow!("No session ID returned"))?;
+    let stream_url = response.stream_url().ok_or_else(|| anyhow!("No stream URL returned"))?;
+    let token = response.token_value().ok_or_else(|| anyhow!("No token returned"))?;
+    
+    // Prepare session data
+    let session_data = serde_json::json!({
+        "SessionId": session_id,
+        "TokenValue": token,
+        "StreamUrl": stream_url
+    });
+    
+    let start_session_request = serde_json::json!({
+        "SessionId": session_id,
+        "Target": &config.instance_id
+    });
+    
+    // Build session-manager-plugin command
+    let mut plugin_cmd = vec![
+        "session-manager-plugin".to_string(),
+        session_data.to_string(),
+        config.region.as_deref().unwrap_or("us-east-1").to_string(),
+        "StartSession".to_string(),
+        config.profile.as_deref().unwrap_or("").to_string(),
+        start_session_request.to_string(),
+        format!("https://ssm.{}.amazonaws.com", config.region.as_deref().unwrap_or("us-east-1")),
+    ];
+    
+    if config.port_forward {
+        let local_port_val = config.local_port.unwrap();
+        let remote_port_val = config.remote_port.unwrap();
+        
+        let parameters = if config.remote_host == "localhost" || config.remote_host == "127.0.0.1" {
+            serde_json::json!({
+                "localPortNumber": [local_port_val.to_string()],
+                "portNumber": [remote_port_val.to_string()]
+            })
+        } else {
+            serde_json::json!({
+                "localPortNumber": [local_port_val.to_string()],
+                "portNumber": [remote_port_val.to_string()],
+                "host": [&config.remote_host]
+            })
+        };
+        plugin_cmd.push(parameters.to_string());
+    }
+    
+    // Use built-in recorder (works on all platforms with timing)
+    let timing_file = format!("{}.timing", output_file);
+    let mut plugin_command = Command::new("session-manager-plugin");
+    plugin_command.args(&plugin_cmd[1..]); // Skip the first element which is the command name
+    
+    let recorder = Recorder::new(output_file, &timing_file)?;
+    recorder.record_command(plugin_command, is_plain_text)?;
+    
+    Ok(())
+}
+
 pub fn print_session_summary(summary: &SessionSummary) {
     eprintln!();
 
@@ -476,9 +785,124 @@ pub fn format_duration(duration: std::time::Duration) -> String {
     }
 }
 
+
+
+
+
+fn view_recorded_session(file_path: &str, play_speed: f64) -> Result<()> {
+    use std::path::Path;
+    
+    let path = Path::new(file_path);
+    if !path.exists() {
+        return Err(anyhow!("File not found: {}", file_path));
+    }
+    
+    println!("Viewing recorded session: {}", file_path);
+    println!("{}", "=".repeat(50));
+    
+    // Try different methods to view the file
+    
+    // Method 1: Check for timing file and use built-in or external scriptreplay
+    let timing_file = format!("{}.timing", file_path);
+    if std::path::Path::new(&timing_file).exists() {
+        // Try external scriptreplay first (if available), then fall back to built-in
+        if let Ok(status) = Command::new("scriptreplay").arg("-h").output() {
+            if status.status.success() {
+                println!("🎬 Playing back session with external scriptreplay");
+                println!("   Press Ctrl+C to stop, or wait for automatic completion");
+                println!("   Playback speed: {}x", play_speed);
+                println!();
+                
+                let status = Command::new("scriptreplay")
+                    .arg(&timing_file)
+                    .arg(file_path)
+                    .arg(play_speed.to_string())
+                    .status()?;
+                
+                if status.success() {
+                    return Ok(());
+                } else {
+                    println!("⚠️  External scriptreplay failed, trying built-in version...");
+                }
+            }
+        }
+        
+        // Use built-in scriptreplay implementation
+        println!("📅 Found timing file: {}", timing_file);
+        let player = Player::new(&timing_file, file_path)?;
+        return player.replay(play_speed);
+    } else {
+        // No timing file available
+        println!("⏱️  No timing file found ({})", timing_file);
+        println!("💡 Tip: On Linux, recording with timing creates better playback experience");
+        println!();
+    }
+    
+    // Method 2: Simply display the file content with ANSI interpretation
+    // The terminal will automatically interpret the colors and formatting
+    let content = std::fs::read_to_string(file_path)
+        .unwrap_or_else(|_| {
+            // If it fails as UTF-8, try to read as bytes and show what we can
+            let bytes = std::fs::read(file_path).unwrap_or_default();
+            String::from_utf8_lossy(&bytes).to_string()
+        });
+    
+    // Clean up only the problematic control sequences but preserve colors
+    let cleaned_content = replay_rs::clean_for_display(&content);
+    if !cleaned_content.trim().is_empty() {
+        println!("Session content (with colors preserved):");
+        println!();
+        print!("{}", cleaned_content);
+        return Ok(());
+    }
+    
+    // Method 3: Try to clean up with col command
+    if let Ok(output) = Command::new("col")
+        .args(["-bx"])
+        .stdin(std::fs::File::open(file_path)?)
+        .output() {
+        if output.status.success() {
+            let cleaned_output = String::from_utf8_lossy(&output.stdout);
+            if !cleaned_output.trim().is_empty() {
+                println!("Session content (cleaned with col):");
+                println!();
+                print!("{}", cleaned_output);
+                return Ok(());
+            }
+        }
+    }
+    
+    // Method 4: Try strings command to extract readable text
+    if let Ok(output) = Command::new("strings").arg(file_path).output() {
+        if output.status.success() {
+            println!("Extracted text from session (may be incomplete):");
+            println!();
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            return Ok(());
+        }
+    }
+    
+    // Method 5: Last resort - show raw content with warning
+    println!("Warning: Unable to clean session file. Showing raw content:");
+    println!("For better viewing, try: scriptreplay {} or col -bx < {}", file_path, file_path);
+    println!();
+    print!("{}", content);
+    
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    
+    // Handle view command first
+    if let Some(file_path) = &cli.view {
+        return view_recorded_session(file_path, cli.play_speed);
+    }
+
+    // Validate required arguments
+    let instance_name = cli.instance_name.as_ref()
+        .ok_or_else(|| anyhow!("Instance name is required when not using --view"))?;
 
     // Validate port forwarding arguments
     if cli.port_forward && (cli.local_port.is_none() || cli.remote_port.is_none()) {
@@ -499,7 +923,7 @@ async fn main() -> Result<()> {
         cli.verbose,
     );
     print_debug_lazy(
-        || format!("Instance Name: {}", cli.instance_name),
+        || format!("Instance Name: {}", instance_name),
         cli.verbose,
     );
 
@@ -534,13 +958,13 @@ async fn main() -> Result<()> {
     // Run validation and instance discovery concurrently
     let (_validation_result, instances) = tokio::try_join!(
         validate_aws_config(&config, cli.verbose),
-        find_instances_by_name(&ec2_client, &cli.instance_name, cli.verbose)
+        find_instances_by_name(&ec2_client, instance_name, cli.verbose)
     )?;
 
     if instances.is_empty() {
         print_error(&format!(
             "No running instances found with Name tag: '{}'",
-            cli.instance_name
+            instance_name
         ));
         print_error("Please verify the instance name and ensure the instance is running.");
         std::process::exit(1);
@@ -592,7 +1016,7 @@ async fn main() -> Result<()> {
     let selected_instance = if ssm_available_instances.len() == 1 {
         print_success(&format!(
             "Found 1 SSM-available instance with name: '{}'",
-            cli.instance_name
+            instance_name
         ));
         &ssm_available_instances[0]
     } else {
@@ -607,15 +1031,31 @@ async fn main() -> Result<()> {
     // Record start time
     let start_instant = Instant::now();
 
-    // Start SSM session
-    start_ssm_session(
-        &selected_instance.instance_id,
-        cli.profile.clone(),
-        cli.region.clone(),
-        cli.port_forward,
-        cli.local_port,
-        cli.remote_port,
-        &cli.remote_host,
+    // Determine recording mode
+    let recording_mode = if cli.record.is_some() && cli.record_text.is_some() {
+        return Err(anyhow!("Cannot use both --record and --record-text. Choose one."));
+    } else if let Some(file) = cli.record.clone() {
+        Some((file, false)) // script format
+    } else {
+        cli.record_text.clone().map(|file| (file, true))
+    };
+
+    // Start SSM session (with optional recording)
+    let config = SessionConfig {
+        instance_id: selected_instance.instance_id.clone(),
+        profile: cli.profile.clone(),
+        region: cli.region.clone(),
+        port_forward: cli.port_forward,
+        local_port: cli.local_port,
+        remote_port: cli.remote_port,
+        remote_host: cli.remote_host.clone(),
+        recording_mode,
+        native: cli.native,
+    };
+    
+    start_session_with_recording(
+        config,
+        if cli.native { Some(&ssm_client) } else { None },
     )
     .await?;
 
@@ -787,11 +1227,12 @@ mod tests {
 
         let cmd = Cli::command();
 
-        // Test missing instance name
+        // Test missing instance name (should now be allowed for --view command)
         let result = cmd.clone().try_get_matches_from(vec![
             "aws-ssm-connect",
         ]);
-        assert!(result.is_err());
+        // This should succeed now since instance_name is optional
+        assert!(result.is_ok());
 
         // Test invalid port number
         let result = cmd.clone().try_get_matches_from(vec![
@@ -1734,11 +2175,190 @@ mod tests {
         display_instance_info(&instance_info, 1);
     }
 
+    #[test]
+    fn test_native_ssm_flag() {
+        use clap::Parser;
+        
+        let args = vec![
+            "aws-ssm-connect",
+            "test-server",
+            "--native"
+        ];
+        
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.instance_name, Some("test-server".to_string()));
+        assert!(cli.native);
+        assert!(!cli.port_forward);
+        assert!(!cli.skip_ssm_check);
+    }
+
+    #[test]
+    fn test_native_ssm_with_port_forwarding() {
+        use clap::Parser;
+        
+        let args = vec![
+            "aws-ssm-connect",
+            "test-server", 
+            "--native",
+            "--port-forward",
+            "--local-port", "8080",
+            "--remote-port", "80"
+        ];
+        
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.instance_name, Some("test-server".to_string()));
+        assert!(cli.native);
+        assert!(cli.port_forward);
+        assert_eq!(cli.local_port, Some(8080));
+        assert_eq!(cli.remote_port, Some(80));
+    }
+
+    #[test]
+    fn test_native_ssm_with_skip_checks() {
+        use clap::Parser;
+        
+        let args = vec![
+            "aws-ssm-connect",
+            "test-server",
+            "--native",
+            "--skip-ssm-check"
+        ];
+        
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.instance_name, Some("test-server".to_string()));
+        assert!(cli.native);
+        assert!(cli.skip_ssm_check);
+        assert!(!cli.port_forward);
+    }
+
     // Note: More comprehensive integration tests could be added here using:
     // - Mock AWS SDK clients with conditional compilation  
     // - Docker containers with localstack for AWS service simulation
     // - Property-based testing for configuration validation
     // - Stress testing with concurrent operations
     // - Network failure simulation and retry logic testing
+
+    #[test]
+    fn test_aws_error_handling() {
+        // Test ExpiredToken error
+        let error = handle_aws_error("ExpiredToken: The security token included in the request is invalid", "Test operation");
+        assert!(error.to_string().contains("AWS credentials have expired"));
+        assert!(error.to_string().contains("aws sso login"));
+
+        // Test dispatch failure error (common for expired SSO tokens)
+        let error = handle_aws_error("dispatch failure", "Test operation");
+        assert!(error.to_string().contains("likely expired credentials"));
+        assert!(error.to_string().contains("aws sso login"));
+
+        // Test AccessDenied error
+        let error = handle_aws_error("AccessDenied: User is not authorized", "Test operation");
+        assert!(error.to_string().contains("access is denied"));
+
+        // Test NoCredentialsError
+        let error = handle_aws_error("NoCredentialsError: Unable to locate credentials", "Test operation");
+        assert!(error.to_string().contains("No AWS credentials found"));
+        assert!(error.to_string().contains("aws configure"));
+
+        // Test NetworkingError
+        let error = handle_aws_error("NetworkingError: Connection timeout", "Test operation");
+        assert!(error.to_string().contains("Network error"));
+
+        // Test generic error
+        let error = handle_aws_error("Some other AWS error", "Test operation");
+        assert!(error.to_string().contains("Test operation: Some other AWS error"));
+    }
+
+    #[test]
+    fn test_ansi_stripping() {
+        // Test basic ANSI color codes (preserved in new implementation)
+        let input = "\x1b[32mHello\x1b[0m World";
+        let result = replay_rs::clean_for_display(input);
+        assert_eq!(result, "\x1b[32mHello\x1b[0m World");
+
+        // Test the specific sequences with bracketed paste mode removed
+        let input = "?2004h0;\x1b[32m\x1b[0m00m:01\x1b[34m\x1b[0m00m";
+        let result = replay_rs::clean_for_display(input);
+        assert_eq!(result, "0;\x1b[32m\x1b[0m00m:01\x1b[34m\x1b[0m00m");
+
+        // Test bracketed paste mode sequences specifically
+        let input = "?2004hHello World?2004l";
+        let result = replay_rs::clean_for_display(input);
+        assert_eq!(result, "Hello World");
+
+        // Test control character removal (colors preserved)
+        let input = "\x1b[1;32mGreen\x1b[0m\x07\x08Text";
+        let result = replay_rs::clean_for_display(input);
+        assert_eq!(result, "\x1b[1;32mGreen\x1b[0mText");
+
+        // Test preserving tabs and newlines
+        let input = "Line1\tTabbed\nNewline\rReturn";
+        let result = replay_rs::clean_for_display(input);
+        assert_eq!(result, "Line1\tTabbed\nNewline\rReturn");
+
+        // Test ESC sequences with different terminators (colors preserved)
+        let input = "\x1b[2J\x1b[H\x1b[?25lHello\x1b[?25h";
+        let result = replay_rs::clean_for_display(input);
+        assert_eq!(result, "\x1b[2J\x1b[H\x1b[?25lHello\x1b[?25h");
+
+        // Test character set sequences (preserved by clean_for_display)
+        let input = "\x1b(BHello\x1b(0World";
+        let result = replay_rs::clean_for_display(input);
+        assert_eq!(result, "\x1b(BHello\x1b(0World");
+    }
+
+    #[test]
+    fn test_ansi_stripping_multiline() {
+        let input = "\x1b[32mLine 1\x1b[0m\n\x1b[31mLine 2\x1b[0m\n\nEmpty line above";
+        let result = replay_rs::clean_for_display(input);
+        // Colors are now preserved
+        assert!(result.contains("\x1b[32mLine 1\x1b[0m"));
+        assert!(result.contains("\x1b[31mLine 2\x1b[0m"));
+        assert!(result.contains("Empty line above"));
+    }
+
+    #[test]
+    fn test_clean_for_display() {
+        // Test that color codes are preserved
+        let input = "\x1b[32mGreen Text\x1b[0m Normal Text";
+        let result = replay_rs::clean_for_display(input);
+        assert_eq!(result, "\x1b[32mGreen Text\x1b[0m Normal Text");
+
+        // Test that bracketed paste mode is removed
+        let input = "?2004hHello\x1b[31m Red\x1b[0m World?2004l";
+        let result = replay_rs::clean_for_display(input);
+        assert_eq!(result, "Hello\x1b[31m Red\x1b[0m World");
+
+        // Test control character removal but preserve colors
+        let input = "\x1b[1;32mBold Green\x1b[0m\x07\x08Text";
+        let result = replay_rs::clean_for_display(input);
+        assert_eq!(result, "\x1b[1;32mBold Green\x1b[0mText");
+    }
+
+    #[test]
+    fn test_replay_rs_integration() {
+        use std::fs;
+        
+        // Create test timing file
+        let timing_content = "0.1 5\n0.2 6\n0.1 4\n";
+        fs::write("test_timing.txt", timing_content).unwrap();
+        
+        // Create test typescript file
+        let typescript_content = "Hello\nWorld!\nTest";
+        fs::write("test_typescript.txt", typescript_content).unwrap();
+        
+        // Test the replay-rs Player (it should not crash)
+        let player = Player::new("test_timing.txt", "test_typescript.txt");
+        assert!(player.is_ok());
+        
+        // Test dump functionality (faster than full replay in tests)
+        let result = player.unwrap().dump();
+        
+        // Clean up
+        fs::remove_file("test_timing.txt").unwrap();
+        fs::remove_file("test_typescript.txt").unwrap();
+        
+        // Should succeed
+        assert!(result.is_ok());
+    }
 }
 
