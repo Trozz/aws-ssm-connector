@@ -168,7 +168,7 @@ impl NativeSsmSession {
         // Send token directly as first message
         println!("Sending token as first message...");
         ws_sender
-            .send(Message::Text(token.to_string()))
+            .send(Message::Text(token.to_string().into()))
             .await
             .map_err(|e| anyhow!("Failed to send token: {}", e))?;
         println!("Token sent successfully");
@@ -232,7 +232,7 @@ impl NativeSsmSession {
                                         sequence_number += 1;
 
                                         let msg_json = serde_json::to_string(&input_msg)?;
-                                        if let Err(e) = ws_sender.send(Message::Text(msg_json)).await {
+                                        if let Err(e) = ws_sender.send(Message::Text(msg_json.into())).await {
                                             eprintln!("Failed to send Ctrl+C: {}", e);
                                             break;
                                         }
@@ -257,7 +257,7 @@ impl NativeSsmSession {
                                     sequence_number += 1;
 
                                     let msg_json = serde_json::to_string(&input_msg)?;
-                                    if let Err(e) = ws_sender.send(Message::Text(msg_json)).await {
+                                    if let Err(e) = ws_sender.send(Message::Text(msg_json.into())).await {
                                         eprintln!("Failed to send input: {}", e);
                                         break;
                                     }
@@ -279,7 +279,7 @@ impl NativeSsmSession {
                                     sequence_number += 1;
 
                                     let msg_json = serde_json::to_string(&input_msg)?;
-                                    if let Err(e) = ws_sender.send(Message::Text(msg_json)).await {
+                                    if let Err(e) = ws_sender.send(Message::Text(msg_json.into())).await {
                                         eprintln!("Failed to send enter: {}", e);
                                         break;
                                     }
@@ -301,7 +301,7 @@ impl NativeSsmSession {
                                     sequence_number += 1;
 
                                     let msg_json = serde_json::to_string(&input_msg)?;
-                                    if let Err(e) = ws_sender.send(Message::Text(msg_json)).await {
+                                    if let Err(e) = ws_sender.send(Message::Text(msg_json.into())).await {
                                         eprintln!("Failed to send backspace: {}", e);
                                         break;
                                     }
@@ -397,7 +397,7 @@ impl NativeSsmSession {
         token: String,
     ) -> Result<()> {
         let url = Url::parse(&format!("{}?token={}", ws_url, token))?;
-        let (ws_stream, _) = connect_async(url).await?;
+        let (ws_stream, _) = connect_async(url.as_str()).await?;
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
         let mut buffer = [0; 4096];
@@ -424,7 +424,7 @@ impl NativeSsmSession {
                             sequence_number += 1;
 
                             let msg_json = serde_json::to_string(&msg)?;
-                            ws_sender.send(Message::Binary(msg_json.into_bytes())).await?;
+                            ws_sender.send(Message::Binary(msg_json.into_bytes().into())).await?;
                         }
                         Err(e) => {
                             eprintln!("TCP read error: {}", e);
