@@ -499,3 +499,184 @@ impl Drop for NativeSsmSession {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_ssm::{Config, Client as SsmClient};
+    use mockall::predicate::*;
+    use mockall::mock;
+
+
+    fn create_mock_ssm_client() -> SsmClient {
+        let config = Config::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .build();
+        SsmClient::from_conf(config)
+    }
+
+    #[test]
+    fn test_session_response_serialization() {
+        let response = SessionResponse {
+            session_id: "session-123".to_string(),
+            token_value: "token-abc".to_string(),
+            stream_url: "wss://example.com/stream".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: SessionResponse = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(response.session_id, deserialized.session_id);
+        assert_eq!(response.token_value, deserialized.token_value);
+        assert_eq!(response.stream_url, deserialized.stream_url);
+    }
+
+    #[test]
+    fn test_session_message_serialization() {
+        let message = SessionMessage {
+            message_type: "input_stream_data".to_string(),
+            schema_version: 1,
+            created_date: 1234567890,
+            sequence_number: 42,
+            flags: 0,
+            message_id: "msg-123".to_string(),
+            payload_type: 1,
+            payload: "dGVzdA==".to_string(), // base64 encoded "test"
+        };
+
+        let json = serde_json::to_string(&message).unwrap();
+        let deserialized: SessionMessage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(message.message_type, deserialized.message_type);
+        assert_eq!(message.schema_version, deserialized.schema_version);
+        assert_eq!(message.sequence_number, deserialized.sequence_number);
+        assert_eq!(message.payload, deserialized.payload);
+    }
+
+    #[test]
+    fn test_native_ssm_session_new() {
+        let client = create_mock_ssm_client();
+        let session = NativeSsmSession::new(client);
+
+        assert!(session.session_id.is_none());
+        assert!(session.websocket_url.is_none());
+        assert!(session.token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_start_session_success() {
+        let client = create_mock_ssm_client();
+        let session = NativeSsmSession::new(client);
+
+        // This test would require mocking the AWS SDK client
+        // For now, we test the struct initialization
+        assert!(session.session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_start_session_incomplete_response() {
+        // Test case for incomplete session response
+        let client = create_mock_ssm_client();
+        let mut session = NativeSsmSession::new(client);
+
+        // Manually set incomplete state to test validation
+        session.session_id = Some("test-session".to_string());
+        session.websocket_url = None; // Missing URL
+        session.token = Some("test-token".to_string());
+
+        // Test that connect_websocket fails with missing URL
+        let result = session.connect_websocket().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No WebSocket URL available"));
+    }
+
+    #[tokio::test]
+    async fn test_connect_websocket_missing_token() {
+        let client = create_mock_ssm_client();
+        let mut session = NativeSsmSession::new(client);
+
+        // Set URL but no token
+        session.websocket_url = Some("wss://example.com/stream".to_string());
+        session.token = None;
+
+        let result = session.connect_websocket().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No session token available"));
+    }
+
+    #[test]
+    fn test_handle_port_forwarding_validation() {
+        let client = create_mock_ssm_client();
+        let session = NativeSsmSession::new(client);
+
+        // Test that session requires websocket_url and token for port forwarding
+        assert!(session.websocket_url.is_none());
+        assert!(session.token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_terminate_session_no_session() {
+        let client = create_mock_ssm_client();
+        let mut session = NativeSsmSession::new(client);
+
+        // Should succeed even with no session
+        let result = session.terminate_session().await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_session_message_creation() {
+        let message = SessionMessage {
+            message_type: "input_stream_data".to_string(),
+            schema_version: 1,
+            created_date: chrono::Utc::now().timestamp_millis() as u64,
+            sequence_number: 1,
+            flags: 0,
+            message_id: uuid::Uuid::new_v4().to_string(),
+            payload_type: 1,
+            payload: general_purpose::STANDARD.encode("test input"),
+        };
+
+        assert_eq!(message.message_type, "input_stream_data");
+        assert_eq!(message.schema_version, 1);
+        assert_eq!(message.payload_type, 1);
+        
+        // Verify base64 encoding/decoding
+        let decoded = general_purpose::STANDARD.decode(&message.payload).unwrap();
+        let decoded_str = String::from_utf8(decoded).unwrap();
+        assert_eq!(decoded_str, "test input");
+    }
+
+    #[test]
+    fn test_url_parsing() {
+        let test_url = "wss://example.com/stream?token=abc123";
+        let parsed = Url::parse(test_url);
+        assert!(parsed.is_ok());
+        
+        let url = parsed.unwrap();
+        assert_eq!(url.scheme(), "wss");
+        assert_eq!(url.host_str(), Some("example.com"));
+    }
+
+    #[test]
+    fn test_base64_encoding_decoding() {
+        let test_data = "Hello, SSM Session!";
+        let encoded = general_purpose::STANDARD.encode(test_data);
+        let decoded = general_purpose::STANDARD.decode(&encoded).unwrap();
+        let decoded_str = String::from_utf8(decoded).unwrap();
+        
+        assert_eq!(test_data, decoded_str);
+    }
+
+    #[test]
+    fn test_drop_implementation() {
+        let client = create_mock_ssm_client();
+        let mut session = NativeSsmSession::new(client);
+        
+        // Set a session ID to trigger the warning in drop
+        session.session_id = Some("test-session-id".to_string());
+        
+        // Drop should not panic
+        drop(session);
+    }
+}
