@@ -93,7 +93,6 @@ struct Cli {
     /// Playback speed for session replay (default: 1.0, 2.0 = 2x speed, 0.5 = half speed)
     #[arg(long = "play-speed", default_value = "1.0")]
     play_speed: f64,
-
 }
 
 #[derive(Debug, Clone)]
@@ -143,7 +142,7 @@ pub fn print_debug(message: &str, verbose: bool) {
 }
 
 // Optimized version that takes a closure to avoid string formatting when not needed
-pub fn print_debug_lazy<F>(message_fn: F, verbose: bool) 
+pub fn print_debug_lazy<F>(message_fn: F, verbose: bool)
 where
     F: FnOnce() -> String,
 {
@@ -173,7 +172,9 @@ fn handle_aws_error(error: &str, operation: &str) -> anyhow::Error {
     } else if error.contains("NoCredentialsError") || error.contains("CredentialsNotLoaded") {
         anyhow!("No AWS credentials found. Please configure your credentials:\n  - Run 'aws configure' to set up basic credentials\n  - Or use 'aws sso login' for SSO authentication\n  - Or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables")
     } else if error.contains("UnknownHostException") || error.contains("NetworkingError") {
-        anyhow!("Network error connecting to AWS. Please check your internet connection and try again.")
+        anyhow!(
+            "Network error connecting to AWS. Please check your internet connection and try again."
+        )
     } else if error.contains("dispatch failure") {
         // This is likely a token expiration issue that's not being caught by the specific checks above
         anyhow!("AWS authentication failed (likely expired credentials). Please refresh your credentials:\n  - For AWS SSO: Run 'aws sso login --profile <profile-name>'\n  - For regular credentials: Update your ~/.aws/credentials file or run 'aws configure'")
@@ -221,7 +222,10 @@ async fn validate_aws_config(config: &aws_config::SdkConfig, verbose: bool) -> R
             print_debug("AWS authentication successful", verbose);
             Ok(())
         }
-        Err(e) => Err(handle_aws_error(&e.to_string(), "Failed to authenticate with AWS")),
+        Err(e) => Err(handle_aws_error(
+            &e.to_string(),
+            "Failed to authenticate with AWS",
+        )),
     }
 }
 
@@ -261,7 +265,7 @@ async fn find_instances_by_name(
             // Process tags in a single iteration for better performance
             let mut name = "Unknown";
             let mut tags = Vec::with_capacity(instance.tags().len());
-            
+
             for tag in instance.tags() {
                 if let (Some(key), Some(value)) = (tag.key(), tag.value()) {
                     if key == "Name" {
@@ -470,17 +474,21 @@ async fn start_session_manager_plugin(
 ) -> Result<()> {
     // Start SSM session using AWS SDK
     let mut request = ssm_client.start_session().target(&config.instance_id);
-    
+
     if config.port_forward {
-        let local_port_val = config.local_port.ok_or_else(|| anyhow!("Local port required for port forwarding"))?;
-        let remote_port_val = config.remote_port.ok_or_else(|| anyhow!("Remote port required for port forwarding"))?;
-        
+        let local_port_val = config
+            .local_port
+            .ok_or_else(|| anyhow!("Local port required for port forwarding"))?;
+        let remote_port_val = config
+            .remote_port
+            .ok_or_else(|| anyhow!("Remote port required for port forwarding"))?;
+
         if config.remote_host == "localhost" || config.remote_host == "127.0.0.1" {
             request = request.document_name("AWS-StartPortForwardingSession");
         } else {
             request = request.document_name("AWS-StartPortForwardingSessionToRemoteHost");
         }
-        
+
         print_info(&format!(
             "Starting port forwarding session: localhost:{} → {}:{}",
             local_port_val, &config.remote_host, remote_port_val
@@ -488,25 +496,33 @@ async fn start_session_manager_plugin(
     } else {
         print_info("Starting SSM session...");
     }
-    
-    let response = request.send().await
+
+    let response = request
+        .send()
+        .await
         .map_err(|e| handle_aws_error(&e.to_string(), "Failed to start SSM session"))?;
-    
-    let session_id = response.session_id().ok_or_else(|| anyhow!("No session ID returned"))?;
-    let stream_url = response.stream_url().ok_or_else(|| anyhow!("No stream URL returned"))?;
-    let token = response.token_value().ok_or_else(|| anyhow!("No token returned"))?;
-    
+
+    let session_id = response
+        .session_id()
+        .ok_or_else(|| anyhow!("No session ID returned"))?;
+    let stream_url = response
+        .stream_url()
+        .ok_or_else(|| anyhow!("No stream URL returned"))?;
+    let token = response
+        .token_value()
+        .ok_or_else(|| anyhow!("No token returned"))?;
+
     // Prepare session data for session-manager-plugin
     let session_data = serde_json::json!({
         "SessionId": session_id,
         "TokenValue": token,
         "StreamUrl": stream_url
     });
-    
+
     let parameters = if config.port_forward {
         let local_port_val = config.local_port.unwrap();
         let remote_port_val = config.remote_port.unwrap();
-        
+
         if config.remote_host == "localhost" || config.remote_host == "127.0.0.1" {
             serde_json::json!({
                 "localPortNumber": [local_port_val.to_string()],
@@ -522,12 +538,12 @@ async fn start_session_manager_plugin(
     } else {
         serde_json::json!({})
     };
-    
+
     let start_session_request = serde_json::json!({
         "SessionId": session_id,
         "Target": &config.instance_id
     });
-    
+
     // Call session-manager-plugin directly
     let mut cmd = Command::new("session-manager-plugin");
     cmd.arg(session_data.to_string())
@@ -535,21 +551,24 @@ async fn start_session_manager_plugin(
         .arg("StartSession")
         .arg(config.profile.as_deref().unwrap_or(""))
         .arg(start_session_request.to_string())
-        .arg(format!("https://ssm.{}.amazonaws.com", config.region.as_deref().unwrap_or("us-east-1")));
-    
+        .arg(format!(
+            "https://ssm.{}.amazonaws.com",
+            config.region.as_deref().unwrap_or("us-east-1")
+        ));
+
     if config.port_forward {
         cmd.arg(parameters.to_string());
     }
-    
+
     let status = cmd.status()?;
-    
+
     if !status.success() {
         return Err(anyhow!(
             "session-manager-plugin failed with exit code: {:?}",
             status.code()
         ));
     }
-    
+
     Ok(())
 }
 
@@ -559,16 +578,18 @@ async fn start_session_with_recording(
 ) -> Result<()> {
     if let Some((output_file, is_plain_text)) = &config.recording_mode {
         // Record session using script command (Unix/Linux/macOS)
-        let _session_type = if config.port_forward { "port-forward" } else { "interactive" };
-        
+        let _session_type = if config.port_forward {
+            "port-forward"
+        } else {
+            "interactive"
+        };
+
         // Handle recording for different modes
         if config.native {
             if let Some(client) = ssm_client {
                 print_info(&format!("Recording session to: {}", output_file));
                 // For native mode, we need to wrap our session-manager-plugin call
-                return record_native_session(
-                    client, &config, output_file, *is_plain_text
-                ).await;
+                return record_native_session(client, &config, output_file, *is_plain_text).await;
             } else {
                 return Err(anyhow!("SSM client required for native mode"));
             }
@@ -580,18 +601,22 @@ async fn start_session_with_recording(
                 "--target".to_string(),
                 config.instance_id.clone(),
             ];
-            
+
             if let Some(p) = &config.profile {
                 aws_args.extend(vec!["--profile".to_string(), p.clone()]);
             }
             if let Some(r) = &config.region {
                 aws_args.extend(vec!["--region".to_string(), r.clone()]);
             }
-            
+
             if config.port_forward {
-                let local_port = config.local_port.ok_or_else(|| anyhow!("Local port required"))?;
-                let remote_port = config.remote_port.ok_or_else(|| anyhow!("Remote port required"))?;
-                
+                let local_port = config
+                    .local_port
+                    .ok_or_else(|| anyhow!("Local port required"))?;
+                let remote_port = config
+                    .remote_port
+                    .ok_or_else(|| anyhow!("Remote port required"))?;
+
                 if config.remote_host == "localhost" || config.remote_host == "127.0.0.1" {
                     aws_args.extend(vec![
                         "--document-name".to_string(),
@@ -604,23 +629,26 @@ async fn start_session_with_recording(
                         "--document-name".to_string(),
                         "AWS-StartPortForwardingSessionToRemoteHost".to_string(),
                         "--parameters".to_string(),
-                        format!("localPortNumber={},portNumber={},host={}", local_port, remote_port, &config.remote_host),
+                        format!(
+                            "localPortNumber={},portNumber={},host={}",
+                            local_port, remote_port, &config.remote_host
+                        ),
                     ]);
                 }
             }
-            
+
             let timing_file = format!("{}.timing", output_file);
-            
+
             // Use built-in recorder (works on all platforms with timing)
             let mut aws_cmd = Command::new("aws");
             aws_cmd.args(&aws_args);
             let recorder = Recorder::new(output_file, &timing_file)?;
             recorder.record_command(aws_cmd, *is_plain_text)?;
-            
+
             return Ok(());
         }
     }
-    
+
     // No recording, run normally
     if config.native {
         if let Some(client) = ssm_client {
@@ -630,9 +658,15 @@ async fn start_session_with_recording(
         }
     } else {
         start_ssm_session(
-            &config.instance_id, config.profile, config.region,
-            config.port_forward, config.local_port, config.remote_port, &config.remote_host
-        ).await
+            &config.instance_id,
+            config.profile,
+            config.region,
+            config.port_forward,
+            config.local_port,
+            config.remote_port,
+            &config.remote_host,
+        )
+        .await
     }
 }
 
@@ -644,37 +678,49 @@ async fn record_native_session(
 ) -> Result<()> {
     // Start SSM session using AWS SDK (same as start_session_manager_plugin)
     let mut request = ssm_client.start_session().target(&config.instance_id);
-    
+
     if config.port_forward {
-        config.local_port.ok_or_else(|| anyhow!("Local port required"))?;
-        config.remote_port.ok_or_else(|| anyhow!("Remote port required"))?;
-        
+        config
+            .local_port
+            .ok_or_else(|| anyhow!("Local port required"))?;
+        config
+            .remote_port
+            .ok_or_else(|| anyhow!("Remote port required"))?;
+
         if config.remote_host == "localhost" || config.remote_host == "127.0.0.1" {
             request = request.document_name("AWS-StartPortForwardingSession");
         } else {
             request = request.document_name("AWS-StartPortForwardingSessionToRemoteHost");
         }
     }
-    
-    let response = request.send().await
+
+    let response = request
+        .send()
+        .await
         .map_err(|e| handle_aws_error(&e.to_string(), "Failed to start SSM session"))?;
-    
-    let session_id = response.session_id().ok_or_else(|| anyhow!("No session ID returned"))?;
-    let stream_url = response.stream_url().ok_or_else(|| anyhow!("No stream URL returned"))?;
-    let token = response.token_value().ok_or_else(|| anyhow!("No token returned"))?;
-    
+
+    let session_id = response
+        .session_id()
+        .ok_or_else(|| anyhow!("No session ID returned"))?;
+    let stream_url = response
+        .stream_url()
+        .ok_or_else(|| anyhow!("No stream URL returned"))?;
+    let token = response
+        .token_value()
+        .ok_or_else(|| anyhow!("No token returned"))?;
+
     // Prepare session data
     let session_data = serde_json::json!({
         "SessionId": session_id,
         "TokenValue": token,
         "StreamUrl": stream_url
     });
-    
+
     let start_session_request = serde_json::json!({
         "SessionId": session_id,
         "Target": &config.instance_id
     });
-    
+
     // Build session-manager-plugin command
     let mut plugin_cmd = vec![
         "session-manager-plugin".to_string(),
@@ -683,13 +729,16 @@ async fn record_native_session(
         "StartSession".to_string(),
         config.profile.as_deref().unwrap_or("").to_string(),
         start_session_request.to_string(),
-        format!("https://ssm.{}.amazonaws.com", config.region.as_deref().unwrap_or("us-east-1")),
+        format!(
+            "https://ssm.{}.amazonaws.com",
+            config.region.as_deref().unwrap_or("us-east-1")
+        ),
     ];
-    
+
     if config.port_forward {
         let local_port_val = config.local_port.unwrap();
         let remote_port_val = config.remote_port.unwrap();
-        
+
         let parameters = if config.remote_host == "localhost" || config.remote_host == "127.0.0.1" {
             serde_json::json!({
                 "localPortNumber": [local_port_val.to_string()],
@@ -704,15 +753,15 @@ async fn record_native_session(
         };
         plugin_cmd.push(parameters.to_string());
     }
-    
+
     // Use built-in recorder (works on all platforms with timing)
     let timing_file = format!("{}.timing", output_file);
     let mut plugin_command = Command::new("session-manager-plugin");
     plugin_command.args(&plugin_cmd[1..]); // Skip the first element which is the command name
-    
+
     let recorder = Recorder::new(output_file, &timing_file)?;
     recorder.record_command(plugin_command, is_plain_text)?;
-    
+
     Ok(())
 }
 
@@ -785,23 +834,19 @@ pub fn format_duration(duration: std::time::Duration) -> String {
     }
 }
 
-
-
-
-
 fn view_recorded_session(file_path: &str, play_speed: f64) -> Result<()> {
     use std::path::Path;
-    
+
     let path = Path::new(file_path);
     if !path.exists() {
         return Err(anyhow!("File not found: {}", file_path));
     }
-    
+
     println!("Viewing recorded session: {}", file_path);
     println!("{}", "=".repeat(50));
-    
+
     // Try different methods to view the file
-    
+
     // Method 1: Check for timing file and use built-in or external scriptreplay
     let timing_file = format!("{}.timing", file_path);
     if std::path::Path::new(&timing_file).exists() {
@@ -812,13 +857,13 @@ fn view_recorded_session(file_path: &str, play_speed: f64) -> Result<()> {
                 println!("   Press Ctrl+C to stop, or wait for automatic completion");
                 println!("   Playback speed: {}x", play_speed);
                 println!();
-                
+
                 let status = Command::new("scriptreplay")
                     .arg(&timing_file)
                     .arg(file_path)
                     .arg(play_speed.to_string())
                     .status()?;
-                
+
                 if status.success() {
                     return Ok(());
                 } else {
@@ -826,7 +871,7 @@ fn view_recorded_session(file_path: &str, play_speed: f64) -> Result<()> {
                 }
             }
         }
-        
+
         // Use built-in scriptreplay implementation
         println!("📅 Found timing file: {}", timing_file);
         let player = Player::new(&timing_file, file_path)?;
@@ -837,16 +882,15 @@ fn view_recorded_session(file_path: &str, play_speed: f64) -> Result<()> {
         println!("💡 Tip: On Linux, recording with timing creates better playback experience");
         println!();
     }
-    
+
     // Method 2: Simply display the file content with ANSI interpretation
     // The terminal will automatically interpret the colors and formatting
-    let content = std::fs::read_to_string(file_path)
-        .unwrap_or_else(|_| {
-            // If it fails as UTF-8, try to read as bytes and show what we can
-            let bytes = std::fs::read(file_path).unwrap_or_default();
-            String::from_utf8_lossy(&bytes).to_string()
-        });
-    
+    let content = std::fs::read_to_string(file_path).unwrap_or_else(|_| {
+        // If it fails as UTF-8, try to read as bytes and show what we can
+        let bytes = std::fs::read(file_path).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).to_string()
+    });
+
     // Clean up only the problematic control sequences but preserve colors
     let cleaned_content = replay_rs::clean_for_display(&content);
     if !cleaned_content.trim().is_empty() {
@@ -855,12 +899,13 @@ fn view_recorded_session(file_path: &str, play_speed: f64) -> Result<()> {
         print!("{}", cleaned_content);
         return Ok(());
     }
-    
+
     // Method 3: Try to clean up with col command
     if let Ok(output) = Command::new("col")
         .args(["-bx"])
         .stdin(std::fs::File::open(file_path)?)
-        .output() {
+        .output()
+    {
         if output.status.success() {
             let cleaned_output = String::from_utf8_lossy(&output.stdout);
             if !cleaned_output.trim().is_empty() {
@@ -871,7 +916,7 @@ fn view_recorded_session(file_path: &str, play_speed: f64) -> Result<()> {
             }
         }
     }
-    
+
     // Method 4: Try strings command to extract readable text
     if let Ok(output) = Command::new("strings").arg(file_path).output() {
         if output.status.success() {
@@ -881,27 +926,32 @@ fn view_recorded_session(file_path: &str, play_speed: f64) -> Result<()> {
             return Ok(());
         }
     }
-    
+
     // Method 5: Last resort - show raw content with warning
     println!("Warning: Unable to clean session file. Showing raw content:");
-    println!("For better viewing, try: scriptreplay {} or col -bx < {}", file_path, file_path);
+    println!(
+        "For better viewing, try: scriptreplay {} or col -bx < {}",
+        file_path, file_path
+    );
     println!();
     print!("{}", content);
-    
+
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    
+
     // Handle view command first
     if let Some(file_path) = &cli.view {
         return view_recorded_session(file_path, cli.play_speed);
     }
 
     // Validate required arguments
-    let instance_name = cli.instance_name.as_ref()
+    let instance_name = cli
+        .instance_name
+        .as_ref()
         .ok_or_else(|| anyhow!("Instance name is required when not using --view"))?;
 
     // Validate port forwarding arguments
@@ -916,25 +966,29 @@ async fn main() -> Result<()> {
         cli.verbose,
     );
     print_debug_lazy(
-        || format!(
-            "Region: {}",
-            cli.region.as_deref().unwrap_or("default (from config)")
-        ),
+        || {
+            format!(
+                "Region: {}",
+                cli.region.as_deref().unwrap_or("default (from config)")
+            )
+        },
         cli.verbose,
     );
-    print_debug_lazy(
-        || format!("Instance Name: {}", instance_name),
-        cli.verbose,
-    );
+    print_debug_lazy(|| format!("Instance Name: {}", instance_name), cli.verbose);
 
     if cli.port_forward {
-        print_debug_lazy(|| format!("Mode: {}", "Port Forwarding".green()), cli.verbose);
+        print_debug_lazy(
+            || format!("Mode: {}", "Port Forwarding".green()),
+            cli.verbose,
+        );
         if let (Some(local_port), Some(remote_port)) = (cli.local_port, cli.remote_port) {
             print_debug_lazy(
-                || format!(
-                    "Port Mapping: localhost:{} -> {}:{}",
-                    local_port, cli.remote_host, remote_port
-                ),
+                || {
+                    format!(
+                        "Port Mapping: localhost:{} -> {}:{}",
+                        local_port, cli.remote_host, remote_port
+                    )
+                },
                 cli.verbose,
             );
         }
@@ -951,7 +1005,7 @@ async fn main() -> Result<()> {
 
     // Setup AWS configuration and validate concurrently with instance discovery
     let config = get_aws_config(cli.profile.clone(), cli.region.clone()).await?;
-    
+
     let ec2_client = aws_sdk_ec2::Client::new(&config);
     let ssm_client = aws_sdk_ssm::Client::new(&config);
 
@@ -975,8 +1029,16 @@ async fn main() -> Result<()> {
         instances
     } else {
         // Pre-check SSM availability for all instances concurrently
-        print_debug_lazy(|| format!("Checking SSM availability for {} instances", instances.len()), cli.verbose);
-        
+        print_debug_lazy(
+            || {
+                format!(
+                    "Checking SSM availability for {} instances",
+                    instances.len()
+                )
+            },
+            cli.verbose,
+        );
+
         let ssm_checks: Vec<_> = instances
             .iter()
             .enumerate()
@@ -984,7 +1046,8 @@ async fn main() -> Result<()> {
                 let ssm_client = &ssm_client;
                 let instance_id = &instance.instance_id;
                 async move {
-                    check_ssm_availability(ssm_client, instance_id, false).await
+                    check_ssm_availability(ssm_client, instance_id, false)
+                        .await
                         .map(|_| idx)
                         .map_err(|_| idx)
                 }
@@ -992,7 +1055,7 @@ async fn main() -> Result<()> {
             .collect();
 
         let ssm_results = futures::future::join_all(ssm_checks).await;
-        
+
         // Filter to only SSM-available instances
         let mut available_instances = Vec::new();
         for (idx, result) in ssm_results.into_iter().enumerate() {
@@ -1033,7 +1096,9 @@ async fn main() -> Result<()> {
 
     // Determine recording mode
     let recording_mode = if cli.record.is_some() && cli.record_text.is_some() {
-        return Err(anyhow!("Cannot use both --record and --record-text. Choose one."));
+        return Err(anyhow!(
+            "Cannot use both --record and --record-text. Choose one."
+        ));
     } else if let Some(file) = cli.record.clone() {
         Some((file, false)) // script format
     } else {
@@ -1052,12 +1117,8 @@ async fn main() -> Result<()> {
         recording_mode,
         native: cli.native,
     };
-    
-    start_session_with_recording(
-        config,
-        if cli.native { Some(&ssm_client) } else { None },
-    )
-    .await?;
+
+    start_session_with_recording(config, if cli.native { Some(&ssm_client) } else { None }).await?;
 
     // Calculate session duration
     let duration = start_instant.elapsed();
@@ -1099,10 +1160,22 @@ mod tests {
         assert_eq!(format_duration(std::time::Duration::from_secs(0)), "0s");
         assert_eq!(format_duration(std::time::Duration::from_secs(45)), "45s");
         assert_eq!(format_duration(std::time::Duration::from_secs(60)), "1m 0s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(90)), "1m 30s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(3600)), "1h 0m 0s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(3665)), "1h 1m 5s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(7325)), "2h 2m 5s");
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(90)),
+            "1m 30s"
+        );
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(3600)),
+            "1h 0m 0s"
+        );
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(3665)),
+            "1h 1m 5s"
+        );
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(7325)),
+            "2h 2m 5s"
+        );
     }
 
     #[test]
@@ -1184,20 +1257,21 @@ mod tests {
         use clap::CommandFactory;
 
         let cmd = Cli::command();
-        
+
         // Test valid instance name argument
-        let result = cmd.clone().try_get_matches_from(vec![
-            "aws-ssm-connect",
-            "my-instance",
-        ]);
+        let result = cmd
+            .clone()
+            .try_get_matches_from(vec!["aws-ssm-connect", "my-instance"]);
         assert!(result.is_ok());
 
         // Test with profile and region
         let result = cmd.clone().try_get_matches_from(vec![
             "aws-ssm-connect",
             "my-instance",
-            "--profile", "dev",
-            "--region", "us-west-2",
+            "--profile",
+            "dev",
+            "--region",
+            "us-west-2",
         ]);
         assert!(result.is_ok());
 
@@ -1206,8 +1280,10 @@ mod tests {
             "aws-ssm-connect",
             "my-instance",
             "--port-forward",
-            "--local-port", "8080",
-            "--remote-port", "80",
+            "--local-port",
+            "8080",
+            "--remote-port",
+            "80",
         ]);
         assert!(result.is_ok());
 
@@ -1228,9 +1304,7 @@ mod tests {
         let cmd = Cli::command();
 
         // Test missing instance name (should now be allowed for --view command)
-        let result = cmd.clone().try_get_matches_from(vec![
-            "aws-ssm-connect",
-        ]);
+        let result = cmd.clone().try_get_matches_from(vec!["aws-ssm-connect"]);
         // This should succeed now since instance_name is optional
         assert!(result.is_ok());
 
@@ -1239,7 +1313,8 @@ mod tests {
             "aws-ssm-connect",
             "my-instance",
             "--port-forward",
-            "--local-port", "not-a-number",
+            "--local-port",
+            "not-a-number",
         ]);
         assert!(result.is_err());
     }
@@ -1325,10 +1400,10 @@ mod tests {
     #[test]
     fn test_instance_selection_display() {
         use colored::control::set_override;
-        
+
         // Disable colors for testing
         set_override(false);
-        
+
         let instances = vec![
             InstanceInfo {
                 instance_id: "i-1234567890abcdef0".to_string(),
@@ -1398,16 +1473,16 @@ mod tests {
     #[test]
     fn test_ssm_command_construction_basic() {
         use std::process::Command;
-        
+
         // Test basic session command construction (non-port-forwarding)
         let mut cmd = Command::new("aws");
         cmd.args(["ssm", "start-session"]);
         cmd.args(["--target", "i-1234567890abcdef0"]);
-        
+
         // Verify the command structure
         let program = cmd.get_program();
         assert_eq!(program, "aws");
-        
+
         let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
         assert!(args.contains(&"ssm"));
         assert!(args.contains(&"start-session"));
@@ -1418,13 +1493,13 @@ mod tests {
     #[test]
     fn test_ssm_command_with_profile_and_region() {
         use std::process::Command;
-        
+
         let mut cmd = Command::new("aws");
         cmd.args(["ssm", "start-session"]);
         cmd.args(["--profile", "dev-profile"]);
         cmd.args(["--region", "us-west-2"]);
         cmd.args(["--target", "i-1234567890abcdef0"]);
-        
+
         let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
         assert!(args.contains(&"--profile"));
         assert!(args.contains(&"dev-profile"));
@@ -1435,13 +1510,13 @@ mod tests {
     #[test]
     fn test_port_forwarding_command_localhost() {
         use std::process::Command;
-        
+
         let mut cmd = Command::new("aws");
         cmd.args(["ssm", "start-session"]);
         cmd.args(["--target", "i-1234567890abcdef0"]);
         cmd.args(["--document-name", "AWS-StartPortForwardingSession"]);
         cmd.args(["--parameters", "localPortNumber=8080,portNumber=80"]);
-        
+
         let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
         assert!(args.contains(&"--document-name"));
         assert!(args.contains(&"AWS-StartPortForwardingSession"));
@@ -1452,13 +1527,19 @@ mod tests {
     #[test]
     fn test_port_forwarding_command_remote_host() {
         use std::process::Command;
-        
+
         let mut cmd = Command::new("aws");
         cmd.args(["ssm", "start-session"]);
         cmd.args(["--target", "i-1234567890abcdef0"]);
-        cmd.args(["--document-name", "AWS-StartPortForwardingSessionToRemoteHost"]);
-        cmd.args(["--parameters", "localPortNumber=8080,portNumber=80,host=database.internal"]);
-        
+        cmd.args([
+            "--document-name",
+            "AWS-StartPortForwardingSessionToRemoteHost",
+        ]);
+        cmd.args([
+            "--parameters",
+            "localPortNumber=8080,portNumber=80,host=database.internal",
+        ]);
+
         let args: Vec<&str> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
         assert!(args.contains(&"AWS-StartPortForwardingSessionToRemoteHost"));
         assert!(args.contains(&"localPortNumber=8080,portNumber=80,host=database.internal"));
@@ -1470,9 +1551,12 @@ mod tests {
         let port_forward = true;
         let local_port: Option<u16> = None;
         let remote_port: Option<u16> = Some(80);
-        
+
         let validation_failed = port_forward && (local_port.is_none() || remote_port.is_none());
-        assert!(validation_failed, "Should fail validation when local_port is missing");
+        assert!(
+            validation_failed,
+            "Should fail validation when local_port is missing"
+        );
     }
 
     #[test]
@@ -1480,9 +1564,12 @@ mod tests {
         let port_forward = true;
         let local_port: Option<u16> = Some(8080);
         let remote_port: Option<u16> = None;
-        
+
         let validation_failed = port_forward && (local_port.is_none() || remote_port.is_none());
-        assert!(validation_failed, "Should fail validation when remote_port is missing");
+        assert!(
+            validation_failed,
+            "Should fail validation when remote_port is missing"
+        );
     }
 
     #[test]
@@ -1490,9 +1577,12 @@ mod tests {
         let port_forward = true;
         let local_port: Option<u16> = Some(8080);
         let remote_port: Option<u16> = Some(80);
-        
+
         let validation_failed = port_forward && (local_port.is_none() || remote_port.is_none());
-        assert!(!validation_failed, "Should pass validation when both ports are provided");
+        assert!(
+            !validation_failed,
+            "Should pass validation when both ports are provided"
+        );
     }
 
     #[test]
@@ -1500,15 +1590,18 @@ mod tests {
         let port_forward = false;
         let local_port: Option<u16> = None;
         let remote_port: Option<u16> = None;
-        
+
         let validation_failed = port_forward && (local_port.is_none() || remote_port.is_none());
-        assert!(!validation_failed, "Should pass validation when port forwarding is disabled");
+        assert!(
+            !validation_failed,
+            "Should pass validation when port forwarding is disabled"
+        );
     }
 
     #[test]
     fn test_remote_host_localhost_detection() {
         let remote_hosts = vec!["localhost", "127.0.0.1"];
-        
+
         for host in remote_hosts {
             let is_localhost = host == "localhost" || host == "127.0.0.1";
             assert!(is_localhost, "Should detect {} as localhost", host);
@@ -1518,7 +1611,7 @@ mod tests {
     #[test]
     fn test_remote_host_non_localhost_detection() {
         let remote_hosts = vec!["database.internal", "192.168.1.100", "example.com"];
-        
+
         for host in remote_hosts {
             let is_localhost = host == "localhost" || host == "127.0.0.1";
             assert!(!is_localhost, "Should not detect {} as localhost", host);
@@ -1528,10 +1621,10 @@ mod tests {
     #[test]
     fn test_empty_instance_list_handling() {
         let instances: Vec<InstanceInfo> = vec![];
-        
+
         // Test that empty instance list can be handled
         assert_eq!(instances.len(), 0);
-        
+
         // Test selection items generation with empty list
         let selection_items: Vec<String> = instances
             .iter()
@@ -1542,20 +1635,18 @@ mod tests {
 
     #[test]
     fn test_single_instance_scenario() {
-        let instances = vec![
-            InstanceInfo {
-                instance_id: "i-1234567890abcdef0".to_string(),
-                name: "single-server".to_string(),
-                instance_type: "t3.micro".to_string(),
-                state: "running".to_string(),
-                private_ip: Some("10.0.1.100".to_string()),
-                public_ip: None,
-                tags: vec![],
-            }
-        ];
+        let instances = vec![InstanceInfo {
+            instance_id: "i-1234567890abcdef0".to_string(),
+            name: "single-server".to_string(),
+            instance_type: "t3.micro".to_string(),
+            state: "running".to_string(),
+            private_ip: Some("10.0.1.100".to_string()),
+            public_ip: None,
+            tags: vec![],
+        }];
 
         assert_eq!(instances.len(), 1);
-        
+
         // In main(), this would skip the selection dialog and use instances[0] directly
         let selected_instance = &instances[0];
         assert_eq!(selected_instance.name, "single-server");
@@ -1577,7 +1668,7 @@ mod tests {
             .find(|(key, _)| key == "Name")
             .map(|(_, value)| value.clone())
             .unwrap_or("Unknown".to_string());
-        
+
         assert_eq!(name_tag, "web-server-1");
 
         // Filter out Name tag to get other tags
@@ -1585,7 +1676,7 @@ mod tests {
             .iter()
             .filter(|(key, _)| key != "Name")
             .collect();
-        
+
         assert_eq!(other_tags.len(), 2);
         assert!(other_tags.contains(&&("Environment".to_string(), "production".to_string())));
         assert!(other_tags.contains(&&("Team".to_string(), "backend".to_string())));
@@ -1604,7 +1695,7 @@ mod tests {
             .find(|(key, _)| key == "Name")
             .map(|(_, value)| value.clone())
             .unwrap_or("Unknown".to_string());
-        
+
         assert_eq!(name_tag, "Unknown");
     }
 
@@ -1618,7 +1709,7 @@ mod tests {
             .find(|(key, _)| key == "Name")
             .map(|(_, value)| value.clone())
             .unwrap_or("Unknown".to_string());
-        
+
         assert_eq!(name_tag, "Unknown");
         assert_eq!(empty_tags.len(), 0);
     }
@@ -1638,7 +1729,7 @@ mod tests {
             .find(|(key, _)| key == "Name")
             .map(|(_, value)| value.clone())
             .unwrap_or("Unknown".to_string());
-        
+
         assert_eq!(name_tag, "first-name");
     }
 
@@ -1657,7 +1748,11 @@ mod tests {
         for (state, should_be_included) in test_cases {
             // In the actual code, only "running" instances are included via the state filter
             let is_running = state == "running";
-            assert_eq!(is_running, should_be_included, "State '{}' inclusion check failed", state);
+            assert_eq!(
+                is_running, should_be_included,
+                "State '{}' inclusion check failed",
+                state
+            );
         }
     }
 
@@ -1666,12 +1761,12 @@ mod tests {
         // Test InstanceInfo creation with missing optional fields
         let instance_info = InstanceInfo {
             instance_id: "i-1234567890abcdef0".to_string(),
-            name: "Unknown".to_string(), // No Name tag
+            name: "Unknown".to_string(),          // No Name tag
             instance_type: "Unknown".to_string(), // Missing instance type
-            state: "Unknown".to_string(), // Missing state
-            private_ip: None, // No private IP
-            public_ip: None, // No public IP
-            tags: vec![], // No tags
+            state: "Unknown".to_string(),         // Missing state
+            private_ip: None,                     // No private IP
+            public_ip: None,                      // No public IP
+            tags: vec![],                         // No tags
         };
 
         assert_eq!(instance_info.instance_id, "i-1234567890abcdef0");
@@ -1686,25 +1781,28 @@ mod tests {
     #[test]
     fn test_environment_variable_precedence() {
         use std::env;
-        
+
         // Use a unique test env var to avoid interference
         let test_var = "AWS_PROFILE_TEST_VAR";
-        
+
         // Set test environment variable
         env::set_var(test_var, "test-env-profile");
-        
+
         // Simulate CLI parsing with no profile argument
         let cli_profile: Option<String> = None;
         let effective_profile = cli_profile.or_else(|| env::var(test_var).ok());
-        
+
         assert_eq!(effective_profile, Some("test-env-profile".to_string()));
-        
+
         // Test CLI argument override
         let cli_profile_override: Option<String> = Some("cli-override-profile".to_string());
         let effective_profile_override = cli_profile_override.or_else(|| env::var(test_var).ok());
-        
-        assert_eq!(effective_profile_override, Some("cli-override-profile".to_string()));
-        
+
+        assert_eq!(
+            effective_profile_override,
+            Some("cli-override-profile".to_string())
+        );
+
         // Clean up test environment variable
         env::remove_var(test_var);
     }
@@ -1712,25 +1810,25 @@ mod tests {
     #[test]
     fn test_aws_region_environment_variable() {
         use std::env;
-        
+
         // Use a unique test env var to avoid interference
         let test_var = "AWS_REGION_TEST_VAR";
-        
+
         // Set test environment variable
         env::set_var(test_var, "eu-west-1");
-        
+
         // Simulate CLI parsing with no region argument
         let cli_region: Option<String> = None;
         let effective_region = cli_region.or_else(|| env::var(test_var).ok());
-        
+
         assert_eq!(effective_region, Some("eu-west-1".to_string()));
-        
+
         // Test CLI argument override
         let cli_region_override: Option<String> = Some("us-east-1".to_string());
         let effective_region_override = cli_region_override.or_else(|| env::var(test_var).ok());
-        
+
         assert_eq!(effective_region_override, Some("us-east-1".to_string()));
-        
+
         // Clean up test environment variable
         env::remove_var(test_var);
     }
@@ -1739,34 +1837,35 @@ mod tests {
     fn test_cli_with_environment_variables() {
         use clap::CommandFactory;
         use std::env;
-        
+
         let original_profile = env::var("AWS_PROFILE").ok();
         let original_region = env::var("AWS_REGION").ok();
-        
+
         // Set environment variables
         env::set_var("AWS_PROFILE", "env-profile");
         env::set_var("AWS_REGION", "env-region");
-        
+
         let cmd = Cli::command();
-        
+
         // Test that CLI still parses correctly with env vars set
-        let result = cmd.clone().try_get_matches_from(vec![
-            "aws-ssm-connect",
-            "test-instance",
-        ]);
-        
+        let result = cmd
+            .clone()
+            .try_get_matches_from(vec!["aws-ssm-connect", "test-instance"]);
+
         assert!(result.is_ok());
-        
+
         // Test explicit CLI args override env vars
         let result = cmd.clone().try_get_matches_from(vec![
             "aws-ssm-connect",
             "test-instance",
-            "--profile", "cli-profile",
-            "--region", "cli-region",
+            "--profile",
+            "cli-profile",
+            "--region",
+            "cli-region",
         ]);
-        
+
         assert!(result.is_ok());
-        
+
         // Restore original environment
         match original_profile {
             Some(value) => env::set_var("AWS_PROFILE", value),
@@ -1783,15 +1882,16 @@ mod tests {
         // Test default remote host value
         let default_remote_host = "localhost";
         assert_eq!(default_remote_host, "localhost");
-        
+
         // Test that default is used when not specified
         let remote_host_arg: Option<String> = None;
         let effective_remote_host = remote_host_arg.unwrap_or_else(|| "localhost".to_string());
         assert_eq!(effective_remote_host, "localhost");
-        
+
         // Test explicit remote host override
         let remote_host_override: Option<String> = Some("database.internal".to_string());
-        let effective_remote_host_override = remote_host_override.unwrap_or_else(|| "localhost".to_string());
+        let effective_remote_host_override =
+            remote_host_override.unwrap_or_else(|| "localhost".to_string());
         assert_eq!(effective_remote_host_override, "database.internal");
     }
 
@@ -1799,10 +1899,10 @@ mod tests {
     fn test_instance_filtering_by_name_exact_match() {
         // Test that the Name tag filter should be exact match
         let test_instances = vec![
-            ("web-server", "web-server"), // Exact match
-            ("web-server-1", "web-server"), // Partial match - should not match in real filter
+            ("web-server", "web-server"),      // Exact match
+            ("web-server-1", "web-server"),    // Partial match - should not match in real filter
             ("web-server-prod", "web-server"), // Partial match - should not match in real filter
-            ("my-web-server", "web-server"), // Partial match - should not match in real filter
+            ("my-web-server", "web-server"),   // Partial match - should not match in real filter
         ];
 
         for (instance_name, search_term) in test_instances {
@@ -1821,7 +1921,10 @@ mod tests {
             ("Name".to_string(), "server-with-dashes".to_string()),
             ("Environment".to_string(), "prod/staging".to_string()),
             ("Cost Center".to_string(), "team-123".to_string()),
-            ("Description".to_string(), "Server with spaces and symbols!@#".to_string()),
+            (
+                "Description".to_string(),
+                "Server with spaces and symbols!@#".to_string(),
+            ),
         ];
 
         // Find Name tag with special characters
@@ -1830,28 +1933,31 @@ mod tests {
             .find(|(key, _)| key == "Name")
             .map(|(_, value)| value.clone())
             .unwrap_or("Unknown".to_string());
-        
+
         assert_eq!(name_tag, "server-with-dashes");
-        
+
         // Verify all tags are preserved
         assert_eq!(special_tags.len(), 4);
-        
+
         // Test that special characters in values are preserved
         let description_tag = special_tags
             .iter()
             .find(|(key, _)| key == "Description")
             .map(|(_, value)| value.clone());
-        
-        assert_eq!(description_tag, Some("Server with spaces and symbols!@#".to_string()));
+
+        assert_eq!(
+            description_tag,
+            Some("Server with spaces and symbols!@#".to_string())
+        );
     }
 
     #[test]
     fn test_error_message_formatting() {
         use colored::control::set_override;
-        
+
         // Disable colors for testing
         set_override(false);
-        
+
         // Test various error message scenarios
         let error_messages = vec![
             "No running instances found with Name tag: 'non-existent-server'",
@@ -1864,7 +1970,7 @@ mod tests {
         for message in error_messages {
             // Test that error messages can be formatted without panicking
             print_error(message);
-            
+
             // Test message length is reasonable
             assert!(message.len() > 0);
             assert!(message.len() < 500, "Error message too long: {}", message);
@@ -1874,10 +1980,10 @@ mod tests {
     #[test]
     fn test_warning_message_formatting() {
         use colored::control::set_override;
-        
+
         // Disable colors for testing
         set_override(false);
-        
+
         let warning_messages = vec![
             "Found 3 instances with the specified name:",
             "Instance may take a moment to become available for SSM",
@@ -1893,10 +1999,10 @@ mod tests {
     #[test]
     fn test_info_and_success_message_formatting() {
         use colored::control::set_override;
-        
+
         // Disable colors for testing
         set_override(false);
-        
+
         let info_messages = vec![
             "Instance ID: i-1234567890abcdef0",
             "Starting SSM session...",
@@ -1923,10 +2029,10 @@ mod tests {
     #[test]
     fn test_verbose_debug_output() {
         use colored::control::set_override;
-        
+
         // Disable colors for testing
         set_override(false);
-        
+
         let debug_messages = vec![
             "AWS SSM Connect Tool",
             "Profile: default",
@@ -1966,12 +2072,12 @@ mod tests {
     fn test_empty_string_handling() {
         // Test handling of empty strings in various contexts
         let instance_info = InstanceInfo {
-            instance_id: "".to_string(), // Empty instance ID
-            name: "".to_string(), // Empty name
-            instance_type: "".to_string(), // Empty type
-            state: "".to_string(), // Empty state
-            private_ip: Some("".to_string()), // Empty IP
-            public_ip: Some("".to_string()), // Empty IP
+            instance_id: "".to_string(),                  // Empty instance ID
+            name: "".to_string(),                         // Empty name
+            instance_type: "".to_string(),                // Empty type
+            state: "".to_string(),                        // Empty state
+            private_ip: Some("".to_string()),             // Empty IP
+            public_ip: Some("".to_string()),              // Empty IP
             tags: vec![("".to_string(), "".to_string())], // Empty tag
         };
 
@@ -1994,7 +2100,10 @@ mod tests {
             tags: vec![
                 ("Name".to_string(), "服务器-测试-🚀".to_string()),
                 ("Team".to_string(), "开发团队".to_string()),
-                ("Special".to_string(), "!@#$%^&*()_+-=[]{}|;':\",./<>?".to_string()),
+                (
+                    "Special".to_string(),
+                    "!@#$%^&*()_+-=[]{}|;':\",./<>?".to_string(),
+                ),
             ],
         };
 
@@ -2007,30 +2116,35 @@ mod tests {
     fn test_port_number_edge_cases() {
         // Test extreme port numbers
         let test_cases = vec![
-            (1, 1),           // Minimum valid ports
-            (80, 443),        // Common ports
-            (8080, 8443),     // Common dev ports
-            (65535, 65534),   // Maximum valid ports
+            (1, 1),         // Minimum valid ports
+            (80, 443),      // Common ports
+            (8080, 8443),   // Common dev ports
+            (65535, 65534), // Maximum valid ports
         ];
 
         for (local_port, remote_port) in test_cases {
             let port_forward = true;
             let local_port_opt = Some(local_port);
             let remote_port_opt = Some(remote_port);
-            
-            let validation_failed = port_forward && (local_port_opt.is_none() || remote_port_opt.is_none());
-            assert!(!validation_failed, "Should pass validation for ports {} -> {}", local_port, remote_port);
+
+            let validation_failed =
+                port_forward && (local_port_opt.is_none() || remote_port_opt.is_none());
+            assert!(
+                !validation_failed,
+                "Should pass validation for ports {} -> {}",
+                local_port, remote_port
+            );
         }
     }
 
     #[test]
     fn test_command_construction_edge_cases() {
         use std::process::Command;
-        
+
         // Test command construction with empty/special values
         let mut cmd = Command::new("aws");
         cmd.args(["ssm", "start-session"]);
-        
+
         // Test with unusual but valid instance IDs
         let unusual_instance_ids = vec![
             "i-0000000000000000a", // Minimum hex
@@ -2042,7 +2156,7 @@ mod tests {
             let mut test_cmd = Command::new("aws");
             test_cmd.args(["ssm", "start-session"]);
             test_cmd.args(["--target", instance_id]);
-            
+
             let args: Vec<&str> = test_cmd.get_args().map(|s| s.to_str().unwrap()).collect();
             assert!(args.contains(&instance_id));
         }
@@ -2051,18 +2165,22 @@ mod tests {
     #[test]
     fn test_duration_formatting_edge_cases() {
         use std::time::Duration;
-        
+
         // Test extreme duration values
         let extreme_cases = vec![
-            (Duration::from_millis(999), "0s"), // Less than 1 second
-            (Duration::from_secs(86400), "24h 0m 0s"), // 1 day
-            (Duration::from_secs(90061), "25h 1m 1s"), // Over 1 day
+            (Duration::from_millis(999), "0s"),           // Less than 1 second
+            (Duration::from_secs(86400), "24h 0m 0s"),    // 1 day
+            (Duration::from_secs(90061), "25h 1m 1s"),    // Over 1 day
             (Duration::from_secs(359999), "99h 59m 59s"), // Just under 100 hours
         ];
 
         for (duration, expected) in extreme_cases {
             let formatted = format_duration(duration);
-            assert_eq!(formatted, expected, "Duration formatting failed for {:?}", duration);
+            assert_eq!(
+                formatted, expected,
+                "Duration formatting failed for {:?}",
+                duration
+            );
         }
     }
 
@@ -2070,10 +2188,10 @@ mod tests {
     fn test_session_summary_edge_cases() {
         use colored::control::set_override;
         use std::time::Duration;
-        
+
         // Disable colors for testing
         set_override(false);
-        
+
         // Test session summary with extreme values
         let instance_info = InstanceInfo {
             instance_id: "i-1234567890abcdef0".to_string(),
@@ -2105,32 +2223,33 @@ mod tests {
     #[test]
     fn test_cli_argument_boundary_values() {
         use clap::CommandFactory;
-        
+
         let cmd = Cli::command();
-        
+
         // Test with very long instance name
         let long_name = "a".repeat(100);
-        let result = cmd.clone().try_get_matches_from(vec![
-            "aws-ssm-connect",
-            &long_name,
-        ]);
+        let result = cmd
+            .clone()
+            .try_get_matches_from(vec!["aws-ssm-connect", &long_name]);
         assert!(result.is_ok(), "Should handle long instance names");
-        
+
         // Test with special characters in instance name
         let special_name = "server-with-dashes_and_underscores.and.dots";
-        let result = cmd.clone().try_get_matches_from(vec![
-            "aws-ssm-connect",
-            special_name,
-        ]);
-        assert!(result.is_ok(), "Should handle special characters in instance names");
+        let result = cmd
+            .clone()
+            .try_get_matches_from(vec!["aws-ssm-connect", special_name]);
+        assert!(
+            result.is_ok(),
+            "Should handle special characters in instance names"
+        );
     }
 
     #[test]
     fn test_skip_ssm_check_flag() {
         use clap::CommandFactory;
-        
+
         let cmd = Cli::command();
-        
+
         // Test that skip-ssm-check flag is parsed correctly
         let result = cmd.clone().try_get_matches_from(vec![
             "aws-ssm-connect",
@@ -2138,7 +2257,7 @@ mod tests {
             "--skip-ssm-check",
         ]);
         assert!(result.is_ok(), "Should parse skip-ssm-check flag");
-        
+
         // Test combination with other flags
         let result = cmd.clone().try_get_matches_from(vec![
             "aws-ssm-connect",
@@ -2147,7 +2266,10 @@ mod tests {
             "--verbose",
             "--no-summary",
         ]);
-        assert!(result.is_ok(), "Should parse skip-ssm-check with other flags");
+        assert!(
+            result.is_ok(),
+            "Should parse skip-ssm-check with other flags"
+        );
     }
 
     #[test]
@@ -2170,7 +2292,7 @@ mod tests {
 
         // Should handle large tag collections without issues
         assert_eq!(instance_info.tags.len(), 1000);
-        
+
         // Test that display doesn't panic with many tags
         display_instance_info(&instance_info, 1);
     }
@@ -2178,13 +2300,9 @@ mod tests {
     #[test]
     fn test_native_ssm_flag() {
         use clap::Parser;
-        
-        let args = vec![
-            "aws-ssm-connect",
-            "test-server",
-            "--native"
-        ];
-        
+
+        let args = vec!["aws-ssm-connect", "test-server", "--native"];
+
         let cli = Cli::try_parse_from(args).unwrap();
         assert_eq!(cli.instance_name, Some("test-server".to_string()));
         assert!(cli.native);
@@ -2195,16 +2313,18 @@ mod tests {
     #[test]
     fn test_native_ssm_with_port_forwarding() {
         use clap::Parser;
-        
+
         let args = vec![
             "aws-ssm-connect",
-            "test-server", 
+            "test-server",
             "--native",
             "--port-forward",
-            "--local-port", "8080",
-            "--remote-port", "80"
+            "--local-port",
+            "8080",
+            "--remote-port",
+            "80",
         ];
-        
+
         let cli = Cli::try_parse_from(args).unwrap();
         assert_eq!(cli.instance_name, Some("test-server".to_string()));
         assert!(cli.native);
@@ -2216,14 +2336,14 @@ mod tests {
     #[test]
     fn test_native_ssm_with_skip_checks() {
         use clap::Parser;
-        
+
         let args = vec![
             "aws-ssm-connect",
             "test-server",
             "--native",
-            "--skip-ssm-check"
+            "--skip-ssm-check",
         ];
-        
+
         let cli = Cli::try_parse_from(args).unwrap();
         assert_eq!(cli.instance_name, Some("test-server".to_string()));
         assert!(cli.native);
@@ -2232,7 +2352,7 @@ mod tests {
     }
 
     // Note: More comprehensive integration tests could be added here using:
-    // - Mock AWS SDK clients with conditional compilation  
+    // - Mock AWS SDK clients with conditional compilation
     // - Docker containers with localstack for AWS service simulation
     // - Property-based testing for configuration validation
     // - Stress testing with concurrent operations
@@ -2241,7 +2361,10 @@ mod tests {
     #[test]
     fn test_aws_error_handling() {
         // Test ExpiredToken error
-        let error = handle_aws_error("ExpiredToken: The security token included in the request is invalid", "Test operation");
+        let error = handle_aws_error(
+            "ExpiredToken: The security token included in the request is invalid",
+            "Test operation",
+        );
         assert!(error.to_string().contains("AWS credentials have expired"));
         assert!(error.to_string().contains("aws sso login"));
 
@@ -2255,7 +2378,10 @@ mod tests {
         assert!(error.to_string().contains("access is denied"));
 
         // Test NoCredentialsError
-        let error = handle_aws_error("NoCredentialsError: Unable to locate credentials", "Test operation");
+        let error = handle_aws_error(
+            "NoCredentialsError: Unable to locate credentials",
+            "Test operation",
+        );
         assert!(error.to_string().contains("No AWS credentials found"));
         assert!(error.to_string().contains("aws configure"));
 
@@ -2265,7 +2391,9 @@ mod tests {
 
         // Test generic error
         let error = handle_aws_error("Some other AWS error", "Test operation");
-        assert!(error.to_string().contains("Test operation: Some other AWS error"));
+        assert!(error
+            .to_string()
+            .contains("Test operation: Some other AWS error"));
     }
 
     #[test]
@@ -2337,28 +2465,27 @@ mod tests {
     #[test]
     fn test_replay_rs_integration() {
         use std::fs;
-        
+
         // Create test timing file
         let timing_content = "0.1 5\n0.2 6\n0.1 4\n";
         fs::write("test_timing.txt", timing_content).unwrap();
-        
+
         // Create test typescript file
         let typescript_content = "Hello\nWorld!\nTest";
         fs::write("test_typescript.txt", typescript_content).unwrap();
-        
+
         // Test the replay-rs Player (it should not crash)
         let player = Player::new("test_timing.txt", "test_typescript.txt");
         assert!(player.is_ok());
-        
+
         // Test dump functionality (faster than full replay in tests)
         let result = player.unwrap().dump();
-        
+
         // Clean up
         fs::remove_file("test_timing.txt").unwrap();
         fs::remove_file("test_typescript.txt").unwrap();
-        
+
         // Should succeed
         assert!(result.is_ok());
     }
 }
-
