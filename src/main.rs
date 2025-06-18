@@ -1298,6 +1298,123 @@ mod tests {
     }
 
     #[test]
+    fn test_print_functions() {
+        // Test that print functions don't panic
+        print_info("Test info message");
+        print_debug("Test debug message", true);
+        print_debug("Hidden debug message", false);
+        print_success("Test success message");
+        print_warning("Test warning message");
+        print_error("Test error message");
+        
+        // Test debug lazy function
+        print_debug_lazy(|| "Expensive computation".to_string(), true);
+        print_debug_lazy(|| panic!("Should not be called"), false);
+    }
+
+    #[test]
+    fn test_handle_aws_error() {
+        let expired_token_error = handle_aws_error("ExpiredToken occurred", "test operation");
+        assert!(expired_token_error.to_string().contains("expired"));
+        assert!(expired_token_error.to_string().contains("aws sso login"));
+
+        let access_denied_error = handle_aws_error("AccessDenied", "test operation");
+        assert!(access_denied_error.to_string().contains("invalid or access is denied"));
+
+        let no_credentials_error = handle_aws_error("NoCredentialsError", "test operation");
+        assert!(no_credentials_error.to_string().contains("No AWS credentials found"));
+
+        let network_error = handle_aws_error("UnknownHostException", "test operation");
+        assert!(network_error.to_string().contains("Network error"));
+
+        let dispatch_error = handle_aws_error("dispatch failure", "test operation");
+        assert!(dispatch_error.to_string().contains("authentication failed"));
+
+        let generic_error = handle_aws_error("some other error", "test operation");
+        assert_eq!(generic_error.to_string(), "test operation: some other error");
+    }
+
+
+    #[test]
+    fn test_session_config_creation() {
+        let session_config = SessionConfig {
+            instance_id: "i-1234567890abcdef0".to_string(),
+            profile: Some("development".to_string()),
+            region: Some("us-east-1".to_string()),
+            port_forward: true,
+            local_port: Some(8080),
+            remote_port: Some(80),
+            remote_host: "localhost".to_string(),
+            recording_mode: Some(("session.log".to_string(), false)),
+            native: true,
+        };
+
+        assert_eq!(session_config.instance_id, "i-1234567890abcdef0");
+        assert_eq!(session_config.profile, Some("development".to_string()));
+        assert_eq!(session_config.region, Some("us-east-1".to_string()));
+        assert!(session_config.port_forward);
+        assert_eq!(session_config.local_port, Some(8080));
+        assert_eq!(session_config.remote_port, Some(80));
+        assert_eq!(session_config.remote_host, "localhost");
+        assert_eq!(session_config.recording_mode, Some(("session.log".to_string(), false)));
+        assert!(session_config.native);
+    }
+
+
+    #[test]
+    fn test_view_recorded_session_file_not_found() {
+        let result = view_recorded_session("non_existent_file.log", 1.0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("File not found"));
+    }
+
+    #[test] 
+    fn test_debug_trait_implementations() {
+        let instance = InstanceInfo {
+            instance_id: "i-123".to_string(),
+            name: "test".to_string(),
+            instance_type: "t3.micro".to_string(),
+            state: "running".to_string(),
+            private_ip: None,
+            public_ip: None,
+            tags: vec![],
+        };
+
+        let debug_str = format!("{:?}", instance);
+        assert!(debug_str.contains("InstanceInfo"));
+        assert!(debug_str.contains("i-123"));
+
+        let config = SessionConfig {
+            instance_id: "i-123".to_string(),
+            profile: None,
+            region: None,
+            port_forward: false,
+            local_port: None,
+            remote_port: None,
+            remote_host: "localhost".to_string(),
+            recording_mode: None,
+            native: false,
+        };
+
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("SessionConfig"));
+
+        let summary = SessionSummary {
+            instance_info: instance,
+            session_type: "standard".to_string(),
+            local_port: None,
+            remote_port: None,
+            remote_host: None,
+            duration: std::time::Duration::from_secs(60),
+            profile: None,
+            region: None,
+        };
+
+        let debug_str = format!("{:?}", summary);
+        assert!(debug_str.contains("SessionSummary"));
+    }
+
+    #[test]
     fn test_cli_parsing_errors() {
         use clap::CommandFactory;
 
