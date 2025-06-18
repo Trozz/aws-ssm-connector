@@ -82,7 +82,10 @@ impl NativeSsmSession {
 
         println!("Session started: {}", self.session_id.as_ref().unwrap());
         println!("WebSocket URL: {}", self.websocket_url.as_ref().unwrap());
-        println!("Token received: {}", if self.token.is_some() { "Yes" } else { "No" });
+        println!(
+            "Token received: {}",
+            if self.token.is_some() { "Yes" } else { "No" }
+        );
         Ok(())
     }
 
@@ -124,20 +127,24 @@ impl NativeSsmSession {
     }
 
     pub async fn connect_websocket(&self) -> Result<()> {
-        let url = self.websocket_url.as_ref()
+        let url = self
+            .websocket_url
+            .as_ref()
             .ok_or_else(|| anyhow!("No WebSocket URL available"))?;
-        
-        let token = self.token.as_ref()
+
+        let token = self
+            .token
+            .as_ref()
             .ok_or_else(|| anyhow!("No session token available"))?;
 
         // Use the WebSocket URL as-is and add token via headers
         let ws_url = Url::parse(url)?;
-        
+
         println!("Connecting to WebSocket with token in headers: {}", ws_url);
-        
+
         // Create a custom request with the token in the Authorization header
         use tungstenite::handshake::client::generate_key;
-        
+
         let request = Request::builder()
             .uri(ws_url.as_str())
             .header("Host", ws_url.host_str().unwrap())
@@ -148,26 +155,27 @@ impl NativeSsmSession {
             .header("Authorization", format!("Bearer {}", token))
             .body(())
             .unwrap();
-        
+
         let (ws_stream, _) = connect_async(request)
             .await
             .map_err(|e| anyhow!("Failed to connect to WebSocket: {}", e))?;
 
         println!("WebSocket connected successfully");
         println!("Press Ctrl+C 5 times quickly to exit the session");
-        
+
         let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
         // Send token directly as first message
         println!("Sending token as first message...");
-        ws_sender.send(Message::Text(token.to_string())).await
+        ws_sender
+            .send(Message::Text(token.to_string()))
+            .await
             .map_err(|e| anyhow!("Failed to send token: {}", e))?;
         println!("Token sent successfully");
 
         // Set up terminal for raw mode
         println!("Setting up terminal raw mode...");
-        terminal::enable_raw_mode()
-            .map_err(|e| anyhow!("Failed to enable raw mode: {}", e))?;
+        terminal::enable_raw_mode().map_err(|e| anyhow!("Failed to enable raw mode: {}", e))?;
         println!("Raw mode enabled, skipping alternate screen for debugging...");
         // Temporarily skip alternate screen
         // execute!(io::stdout(), EnterAlternateScreen)
@@ -181,7 +189,7 @@ impl NativeSsmSession {
         // Handle terminal I/O
         eprintln!("Starting interactive session loop...");
         eprintln!("Press Ctrl+C 5 times quickly to exit the session");
-        
+
         let mut loop_count = 0;
         eprintln!("About to enter main loop...");
         loop {
@@ -197,15 +205,15 @@ impl NativeSsmSession {
                             match key_event.code {
                                 KeyCode::Char('c') if key_event.modifiers.contains(event::KeyModifiers::CONTROL) => {
                                     let now = std::time::Instant::now();
-                                    
+
                                     // Reset counter if more than 2 seconds have passed
                                     if now.duration_since(last_ctrl_c_time).as_secs() > 2 {
                                         ctrl_c_count = 0;
                                     }
-                                    
+
                                     ctrl_c_count += 1;
                                     last_ctrl_c_time = now;
-                                    
+
                                     if ctrl_c_count >= 5 {
                                         println!("Multiple Ctrl+C detected, exiting session...");
                                         break;
@@ -228,14 +236,14 @@ impl NativeSsmSession {
                                             eprintln!("Failed to send Ctrl+C: {}", e);
                                             break;
                                         }
-                                        
+
                                         println!("Ctrl+C sent to remote session ({}/5 to exit)", ctrl_c_count);
                                     }
                                 }
                                 KeyCode::Char(c) => {
                                     // Reset Ctrl+C counter on any other character input
                                     ctrl_c_count = 0;
-                                    
+
                                     let input_msg = SessionMessage {
                                         message_type: "input_stream_data".to_string(),
                                         schema_version: 1,
@@ -257,7 +265,7 @@ impl NativeSsmSession {
                                 KeyCode::Enter => {
                                     // Reset Ctrl+C counter on Enter
                                     ctrl_c_count = 0;
-                                    
+
                                     let input_msg = SessionMessage {
                                         message_type: "input_stream_data".to_string(),
                                         schema_version: 1,
@@ -279,7 +287,7 @@ impl NativeSsmSession {
                                 KeyCode::Backspace => {
                                     // Reset Ctrl+C counter on backspace
                                     ctrl_c_count = 0;
-                                    
+
                                     let input_msg = SessionMessage {
                                         message_type: "input_stream_data".to_string(),
                                         schema_version: 1,
@@ -363,10 +371,14 @@ impl NativeSsmSession {
 
         while let Ok((socket, addr)) = listener.accept().await {
             println!("New connection from: {}", addr);
-            
-            let url = self.websocket_url.clone()
+
+            let url = self
+                .websocket_url
+                .clone()
                 .ok_or_else(|| anyhow!("No WebSocket URL available"))?;
-            let token = self.token.clone()
+            let token = self
+                .token
+                .clone()
                 .ok_or_else(|| anyhow!("No session token available"))?;
 
             tokio::spawn(async move {
